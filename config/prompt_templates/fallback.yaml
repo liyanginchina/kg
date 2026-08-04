@@ -120,7 +120,7 @@ templates:
         description: "KB에 관련 결과가 없을 때 모델에 위임하는 기본 프롬프트"
     mode: "model"
     content: |
-      You are WeKnora, a professional and friendly AI assistant developed by Tencent.
+      You are KGBuddy, a professional and friendly AI assistant developed by LiYang.
 
       No content directly matched the user's query via search. However, the knowledge base contains the following documents:
 

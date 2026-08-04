@@ -203,6 +203,25 @@ type ChunkingConfig struct {
 	// generating searchable summaries for CSV/Excel tables. The system-owned
 	// output contract remains fixed; these instructions only add domain context.
 	TableMetadataInstructions string `yaml:"table_metadata_instructions,omitempty" json:"table_metadata_instructions,omitempty"`
+	// MaxConcurrentParse caps how many documents of this knowledge base may be
+	// parsed simultaneously (batch upload throttle). 0 = use the default
+	// (DefaultKBMaxConcurrentParse). The cap is enforced per app instance at
+	// the document-process worker entry: tasks over the cap are re-scheduled
+	// with a short delay instead of blocking a worker slot.
+	MaxConcurrentParse int `yaml:"max_concurrent_parse,omitempty" json:"max_concurrent_parse,omitempty"`
+}
+
+// DefaultKBMaxConcurrentParse is the default per-KB cap on concurrently
+// parsed documents when ChunkingConfig.MaxConcurrentParse is unset (<=0).
+const DefaultKBMaxConcurrentParse = 5
+
+// EffectiveMaxConcurrentParse returns the per-KB parse concurrency cap,
+// falling back to DefaultKBMaxConcurrentParse when unset or invalid.
+func (c ChunkingConfig) EffectiveMaxConcurrentParse() int {
+	if c.MaxConcurrentParse > 0 {
+		return c.MaxConcurrentParse
+	}
+	return DefaultKBMaxConcurrentParse
 }
 
 // ResolveParserEngine returns the engine name for the given file type

@@ -409,8 +409,10 @@
                     :rag-enabled="formData.indexingStrategy?.vectorEnabled || formData.indexingStrategy?.keywordEnabled"
                     :all-models="allModels"
                     :table-metadata-instructions="formData.chunkingConfig.tableMetadataInstructions"
+                    :max-concurrent-parse="formData.chunkingConfig.maxConcurrentParse"
                     @update:question-generation="handleQuestionGenerationUpdate"
                     @update:table-metadata-instructions="(value: string) => { if (formData) formData.chunkingConfig.tableMetadataInstructions = value }"
+                    @update:max-concurrent-parse="(value: number) => { if (formData) formData.chunkingConfig.maxConcurrentParse = value }"
                   />
                 </div>
 
@@ -737,7 +739,9 @@ const initFormData = (type: 'document' | 'faq' = 'document') => {
       strategy: 'auto' as string,
       tokenLimit: 0,
       languages: [] as string[],
-      tableMetadataInstructions: ''
+      tableMetadataInstructions: '',
+      // Batch-upload throttle: how many documents may parse at once (default 5).
+      maxConcurrentParse: 5
     },
     storageBackendId: '' as string,
     storageProvider: '' as string,
@@ -860,7 +864,9 @@ const loadKBData = async () => {
         strategy: kb.chunking_config?.strategy || '',
         tokenLimit: kb.chunking_config?.token_limit || 0,
         languages: kb.chunking_config?.languages || [],
-        tableMetadataInstructions: kb.chunking_config?.table_metadata_instructions || ''
+        tableMetadataInstructions: kb.chunking_config?.table_metadata_instructions || '',
+        // 0/absent = server default (5)
+        maxConcurrentParse: kb.chunking_config?.max_concurrent_parse || 5
       },
       storageBackendId: (kb.storage_backend_id || '') as string,
       storageProvider: (kb.storage_provider_config?.provider || kb.storage_config?.provider || 'local') as string,
@@ -1178,6 +1184,7 @@ const buildSubmitData = () => {
       token_limit: formData.value.chunkingConfig.tokenLimit ?? 0,
       languages: formData.value.chunkingConfig.languages ?? [],
       table_metadata_instructions: formData.value.chunkingConfig.tableMetadataInstructions || '',
+      max_concurrent_parse: formData.value.chunkingConfig.maxConcurrentParse || 5,
       ...(formData.value.chunkingConfig.parserEngineRules?.length
         ? { parser_engine_rules: formData.value.chunkingConfig.parserEngineRules }
         : {})
@@ -1397,7 +1404,8 @@ const doSubmit = async () => {
           strategy: formData.value?.chunkingConfig.strategy ?? '',
           tokenLimit: formData.value?.chunkingConfig.tokenLimit ?? 0,
           languages: formData.value?.chunkingConfig.languages ?? [],
-          tableMetadataInstructions: formData.value?.chunkingConfig.tableMetadataInstructions ?? ''
+          tableMetadataInstructions: formData.value?.chunkingConfig.tableMetadataInstructions ?? '',
+          maxConcurrentParse: formData.value?.chunkingConfig.maxConcurrentParse ?? 5
         },
         multimodal: {
           enabled: !!data.vlm_config?.enabled

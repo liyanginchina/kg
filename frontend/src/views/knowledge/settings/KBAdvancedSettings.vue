@@ -59,6 +59,25 @@
       </div>
       </template>
 
+      <!-- Max concurrent parse (batch upload throttle) -->
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>{{ $t('knowledgeEditor.advanced.maxConcurrentParse.label') }}</label>
+          <p class="desc">{{ $t('knowledgeEditor.advanced.maxConcurrentParse.description') }}</p>
+        </div>
+        <div class="setting-control">
+          <t-input-number
+            :model-value="maxConcurrentParse ?? 5"
+            :min="1"
+            :max="50"
+            :step="1"
+            theme="normal"
+            @change="(value: number) => emit('update:maxConcurrentParse', Number(value) || 5)"
+            style="width: 120px;"
+          />
+        </div>
+      </div>
+
       <div class="setting-row setting-row-vertical">
         <div class="setting-info">
           <label>{{ $t('knowledgeEditor.advanced.tableMetadataInstructions.label') }}</label>
@@ -94,6 +113,8 @@ interface Props {
   allModels?: any[]
   embedded?: boolean
   tableMetadataInstructions?: string
+  /** Per-KB cap on concurrently parsed documents during batch upload. Default 5. */
+  maxConcurrentParse?: number
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -103,6 +124,7 @@ const props = withDefaults(defineProps<Props>(), {
 const emit = defineEmits<{
   'update:questionGeneration': [value: QuestionGenerationConfig]
   'update:tableMetadataInstructions': [value: string]
+  'update:maxConcurrentParse': [value: number]
 }>()
 
 const localQuestionGeneration = ref<QuestionGenerationConfig>(

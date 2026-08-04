@@ -34,6 +34,7 @@ type AsynqTaskParams struct {
 	MaintenanceServer    *asynq.Server `name:"maintenanceAsynqServer"`
 	SharedServer         *asynq.Server `name:"sharedAsynqServer"`
 	WikiServer           *asynq.Server `name:"wikiAsynqServer"`
+	GraphServer          *asynq.Server `name:"graphAsynqServer"`
 	KnowledgeService     interfaces.KnowledgeService
 	KnowledgeBaseService interfaces.KnowledgeBaseService
 	TagService           interfaces.KnowledgeTagService
@@ -223,6 +224,19 @@ func NewWikiAsynqServer(svc interfaces.SystemSettingService) *asynq.Server {
 	return newAsynqServer(concurrency, types.QueueWeightsForPool(types.WorkerPoolWiki))
 }
 
+// NewGraphAsynqServer builds the dedicated graph pool: QueueGraph only. Graph
+// extraction is a high-fanout per-chunk task (one asynq task per text chunk),
+// so during a bulk import it would otherwise share the enrichment pool with
+// summary / multimodal / question generation and get starved by their bursts.
+// Isolating it on its own pool (WEKNORA_ASYNQ_GRAPH_CONCURRENCY, default 8)
+// gives graph extraction guaranteed capacity independent of the other
+// enrichment work — the fix for graph builds falling behind / timing out.
+func NewGraphAsynqServer(svc interfaces.SystemSettingService) *asynq.Server {
+	concurrency := resolveWorkerPoolConcurrency(svc).Graph
+	log.Printf("asynq graph-pool server starting with concurrency=%d", concurrency)
+	return newAsynqServer(concurrency, types.QueueWeightsForPool(types.WorkerPoolGraph))
+}
+
 func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// Create a new mux and register all handlers
 	mux := asynq.NewServeMux()
@@ -325,6 +339,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	runPool("maintenance-pool", params.MaintenanceServer)
 	runPool("shared-pool", params.SharedServer)
 	runPool("wiki-pool", params.WikiServer)
+	runPool("graph-pool", params.GraphServer)
 	return mux
 }
 

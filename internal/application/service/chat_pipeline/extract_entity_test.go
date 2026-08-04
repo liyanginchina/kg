@@ -253,8 +253,241 @@ func TestIsLikelyLanguageTag(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.in, func(t *testing.T) {
-			if got := isLikelyLanguageTag(tc.in); got != tc.want {
-				t.Errorf("isLikelyLanguageTag(%q) = %v, want %v", tc.in, got, tc.want)
+		if got := isLikelyLanguageTag(tc.in); got != tc.want {
+			t.Errorf("isLikelyLanguageTag(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+		})
+	}
+}
+
+// TestRepairJSON locks the behavior of the JSON normalization helper used by
+// parseOutput to recover malformed LLM graph output. These are the exact
+// failure modes that previously surfaced as GRAPH_EXTRACT_FAILED:
+//   - unescaped newlines / tabs inside string literals
+//     (invalid character '\n' in string literal)
+//   - stray trailing characters after the closing bracket
+//     (invalid character ')' after object key:value pair)
+//   - trailing commas
+//   - concatenated JSON objects without a wrapping array
+//   - already-escaped quotes must be preserved, not double-escaped
+func TestRepairJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"valid array passthrough", `[{"entity":"A"}]`, `[{"entity":"A"}]`},
+		{"valid object passthrough", `{"entity":"A"}`, `{"entity":"A"}`},
+		{
+			"unescaped newline in string",
+			`{"entity":"A
+B"}`,
+			`{"entity":"A\nB"}`,
+		},
+		{
+			"unescaped tab in string",
+			"{\"entity\":\"A\tB\"}",
+			`{"entity":"A\tB"}`,
+		},
+		{"leading prose + trailing paren", "Result: {\"entity\":\"A\"} ) done", `{"entity":"A"}`},
+		{"trailing comma in array", `[{"entity":"A"},]`, `[{"entity":"A"}]`},
+		{"trailing comma in object", `{"entity":"A",}`, `{"entity":"A"}`},
+		{"concatenated objects", `{"a":1}{"b":2}`, `[{"a":1},{"b":2}]`},
+		{"nested braces preserved", `{"a":{"b":[1,2]}}`, `{"a":{"b":[1,2]}}`},
+		{
+			"already-escaped quote preserved",
+			`{"a":"he said \"hi\""}`,
+			`{"a":"he said \"hi\""}`,
+		},
+		{"non-ASCII between array elements", `[{"entity":"A"}, ä{"entity":"B"}]`, `[{"entity":"A"}, {"entity":"B"}]`},
+		{"non-ASCII without separator comma", `[{"entity":"A"} ä{"entity":"B"}]`, `[{"entity":"A"} ,{"entity":"B"}]`},
+		{"non-ASCII before value start", `[é{"entity":"A"}]`, `[{"entity":"A"}]`},
+		{"non-ASCII between concatenated objects", `{"a":1} ä {"b":2}`, `[{"a":1},{"b":2}]`},
+		// Special ASCII characters leaked into structural positions.
+		{"'<' inside object before key", `{"entity":"A", < "entity2":"B"}`, `{"entity":"A",  "entity2":"B"}`},
+		{"'<' and '>' between array elements", `[{"entity":"A"} < > {"entity":"B"}]`, `[{"entity":"A"}   ,{"entity":"B"}]`},
+		{"html-ish tag between objects", `{"a":1} <think>reasoning</think> {"b":2}`, `[{"a":1},{"b":2}]`},
+		{"stray prose word between objects", `{"entity":"A"} ok {"entity":"B"}`, `[{"entity":"A"},{"entity":"B"}]`},
+		{"markdown/asterisk/hash between elements", `{"a":1} * # {"b":2}`, `[{"a":1},{"b":2}]`},
+		{"mixed special chars between array elements", `[{"entity":"A"} ä < {"entity":"B"}]`, `[{"entity":"A"}   ,{"entity":"B"}]`},
+		{"no json", "just words", ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := repairJSON(tc.in); got != tc.want {
+				t.Errorf("repairJSON(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseGraph_RepairsMalformedLLMJSON drives the full ParseGraph path with
+// the raw shapes the chinalco/DeepSeek graph model actually emits, covering
+// the four GRAPH_EXTRACT_FAILED parse errors reported by the user. Before the
+// fix these all failed the whole chunk; now they parse (and non-mapping list
+// elements are skipped rather than aborting).
+func TestParseGraph_RepairsMalformedLLMJSON(t *testing.T) {
+	cases := []struct {
+		name      string
+		input     string
+		wantNodes int
+		wantRels  int
+	}{
+		{
+			// invalid character '\n' in string literal
+			name: "unescaped newline inside string literal",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\nSmith\", \"entity_attributes\": [\"person\"]},\n" +
+				"  {\"entity1\": \"Alice\", \"entity2\": \"Bob\", \"relation\": \"knows\"}\n" +
+				"]\n" +
+				"```",
+			wantNodes: 3,
+			wantRels:  1,
+		},
+		{
+			// invalid character ')' after object key:value pair
+			name: "stray closing paren after array",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\", \"entity_attributes\": [\"person\"]}\n" +
+				"]\n" +
+				")\n" +
+				"```",
+			wantNodes: 1,
+			wantRels:  0,
+		},
+		{
+			// each item in the sequence must be a mapping
+			name: "non-mapping element in list is skipped",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\"},\n" +
+				"  \"stray prose emitted by model\",\n" +
+				"  {\"entity\": \"Bob\"}\n" +
+				"]\n" +
+				"```",
+			wantNodes: 2,
+			wantRels:  0,
+		},
+		{
+			// invalid character '{' looking for beginning of object key string
+			name: "concatenated objects without wrapping array",
+			input: "```json\n" +
+				"{\"entity\": \"Alice\", \"entity_attributes\": [\"person\"]}\n" +
+				"{\"entity\": \"Bob\", \"entity_attributes\": [\"person\"]}\n" +
+				"```",
+			wantNodes: 2,
+			wantRels:  0,
+		},
+		{
+			name: "trailing comma inside array",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\"},\n" +
+				"  {\"entity\": \"Bob\"},\n" +
+				"]\n" +
+				"```",
+			wantNodes: 2,
+			wantRels:  0,
+		},
+		{
+			// invalid character 'ä' after array element — non-ASCII bytes
+			// (mojibake / stray prose) leaked between array elements.
+			name: "non-ASCII between array elements",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\", \"entity_attributes\": [\"person\"]},\n" +
+				"  ä{\"entity\": \"Bob\", \"entity_attributes\": [\"person\"]}\n" +
+				"]\n" +
+				"```",
+			wantNodes: 2,
+			wantRels:  0,
+		},
+		{
+			// invalid character 'é' looking for beginning of value.
+			name: "non-ASCII before value start",
+			input: "```json\n" +
+				"[é{\"entity\": \"Alice\", \"entity_attributes\": [\"person\"]}]\n" +
+				"```",
+			wantNodes: 1,
+			wantRels:  0,
+		},
+		{
+			// invalid character '<' looking for beginning of object key string.
+			name: "less-than sign inside object",
+			input: "```json\n" +
+				"{\n" +
+				"  \"entity\": \"Alice\",\n" +
+				"  < \"entity_attributes\": [\"person\"]\n" +
+				"}\n" +
+				"```",
+			wantNodes: 1,
+			wantRels:  0,
+		},
+		{
+			// Markdown/HTML fragment leaked between array elements.
+			name: "html fragment between array elements",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\"},\n" +
+				"  <think>ignore this</think>\n" +
+				"  {\"entity\": \"Bob\"}\n" +
+				"]\n" +
+				"```",
+			wantNodes: 2,
+			wantRels:  0,
+		},
+		{
+			// Assorted special characters + prose between list elements.
+			name: "stray prose and special chars between elements",
+			input: "```json\n" +
+				"[\n" +
+				"  {\"entity\": \"Alice\"},\n" +
+				"  ok * # {\"entity\": \"Bob\"}\n" +
+				"]\n" +
+				"```",
+			wantNodes: 2,
+			wantRels:  0,
+		},
+		{
+			// One malformed object (unterminated string) among otherwise-valid
+			// ones. The strict unmarshal of the whole payload fails, but
+			// salvageFragments recovers the good one instead of failing the
+			// entire chunk — this is the "handle every special character"
+			// safety net for structurally-corrupted model output.
+			name: "salvage good fragment when one is malformed",
+			input: "```json\n" +
+				"{\n" +
+				"  \"entity\": \"Alice\",\n" +
+				"  \"entity_attributes\": [\"person\"]\n" +
+				"}\n" +
+				"{\n" +
+				"  \"entity\": \"Bob, \"attr\": [\"person\"]\n" +
+				"}\n" +
+				"```",
+			wantNodes: 1,
+			wantRels:  0,
+		},
+	}
+	ctx := context.Background()
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			f := NewFormater()
+			graph, err := f.ParseGraph(ctx, tc.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if graph == nil {
+				t.Fatalf("expected non-nil graph")
+			}
+			if got := len(graph.Node); got != tc.wantNodes {
+				t.Errorf("nodes: got %d, want %d (graph=%+v)", got, tc.wantNodes, graph)
+			}
+			if got := len(graph.Relation); got != tc.wantRels {
+				t.Errorf("relations: got %d, want %d (graph=%+v)", got, tc.wantRels, graph)
 			}
 		})
 	}

@@ -122,8 +122,9 @@ func TestMergeCitationsIntoItems_AddsNewSlugsAndUnionsChunksAcrossBatches(t *tes
 // batcher never puts too many runes in one batch, preserves document order,
 // and that an oversized chunk gets its own batch.
 func TestSplitChunksIntoCitationBatches_RespectsBudgetAndOrder(t *testing.T) {
-	// Each small chunk is 5k runes → 3 of them should fit in one batch
-	// (15k > 12k limit would spill to a second batch).
+	// Budget is maxRunesPerCitationBatch (24k). Two 10k chunks fit in one
+	// batch (20k ≤ 24k); a third 10k chunk would exceed it (30k > 24k) and
+	// must spill to a new batch.
 	mk := func(idx int, runes int, id string) *types.Chunk {
 		return &types.Chunk{
 			ID:         id,
@@ -133,11 +134,11 @@ func TestSplitChunksIntoCitationBatches_RespectsBudgetAndOrder(t *testing.T) {
 		}
 	}
 	chunks := []*types.Chunk{
-		mk(0, 5000, "id-0"),
-		mk(1, 5000, "id-1"),
-		mk(2, 5000, "id-2"), // this should start a new batch (15k > 12k)
-		// An oversized chunk gets a dedicated batch.
-		mk(3, 20000, "id-big"),
+		mk(0, 10000, "id-0"),
+		mk(1, 10000, "id-1"),
+		mk(2, 10000, "id-2"), // this should start a new batch (30k > 24k)
+		// An oversized chunk (> budget on its own) gets a dedicated batch.
+		mk(3, 40000, "id-big"),
 		mk(4, 1000, "id-small"),
 	}
 	batches := splitChunksIntoCitationBatches(chunks)

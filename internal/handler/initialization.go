@@ -118,6 +118,10 @@ type KBModelConfigRequest struct {
 		TokenLimit                *int      `json:"tokenLimit,omitempty"`
 		Languages                 *[]string `json:"languages,omitempty"`
 		TableMetadataInstructions *string   `json:"tableMetadataInstructions,omitempty"`
+		// MaxConcurrentParse caps concurrent document parsing for this KB
+		// (batch upload throttle). Pointer so "absent" means "no change";
+		// 0 resets to the server default (types.DefaultKBMaxConcurrentParse).
+		MaxConcurrentParse *int `json:"maxConcurrentParse,omitempty"`
 	} `json:"documentSplitting"`
 
 	// 多模态配置（仅模型相关；存储引擎在 storageProvider 中配置）
@@ -353,6 +357,16 @@ func (h *InitializationHandler) UpdateKBConfig(c *gin.Context) {
 	}
 	if req.DocumentSplitting.TableMetadataInstructions != nil {
 		kb.ChunkingConfig.TableMetadataInstructions = strings.TrimSpace(*req.DocumentSplitting.TableMetadataInstructions)
+	}
+	if req.DocumentSplitting.MaxConcurrentParse != nil {
+		v := *req.DocumentSplitting.MaxConcurrentParse
+		if v < 0 {
+			v = 0 // negative → reset to server default
+		}
+		if v > 50 {
+			v = 50 // hard upper bound to protect shared workers
+		}
+		kb.ChunkingConfig.MaxConcurrentParse = v
 	}
 
 	// 更新多模态配置
@@ -1545,6 +1559,9 @@ func (h *InitializationHandler) buildConfigResponse(ctx context.Context, models 
 		}
 		if kb.ChunkingConfig.TableMetadataInstructions != "" {
 			ds["tableMetadataInstructions"] = kb.ChunkingConfig.TableMetadataInstructions
+		}
+		if kb.ChunkingConfig.MaxConcurrentParse > 0 {
+			ds["maxConcurrentParse"] = kb.ChunkingConfig.MaxConcurrentParse
 		}
 		config["documentSplitting"] = ds
 

@@ -3965,7 +3965,12 @@ function renderGraph(opts: RenderGraphOpts = {}) {
 
   applyGraphFilters()
 
-  graphAnimFrame = requestAnimationFrame(tick)
+  // Static layout — no force-simulation animation loop. The initial
+  // circular layout is rendered immediately, which eliminates the CPU
+  // overhead of the requestAnimationFrame tick that recalculates
+  // repulsion/attraction for every node every frame. Users can still
+  // drag nodes and pan/zoom the canvas. Skip the rAF entirely.
+  graphAnimFrame = 0
   graphReady.value = true
 }
 

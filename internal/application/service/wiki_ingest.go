@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/agent"
+	"github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/searchutil"
@@ -2829,13 +2830,71 @@ func realTextRuneCount(content string) int {
 
 // cleanLLMJSON strips markdown code-fence wrappers and sanitizes control characters
 // from LLM-generated JSON output so it can be safely unmarshalled.
+// cleanLLMJSON trims markdown fences and, when the result is not already
+// valid JSON, runs the shared chatpipeline.RepairJSON normalizer (the same
+// one the chunk graph extractor uses) to fix the LLM-produced defects that
+// the chinalco/DeepSeek gateway is notorious for: unescaped control
+// characters inside string literals, leading prose / trailing junk, missing
+// commas between concatenated values, and non-ASCII mojibake leaked into
+// structural positions. A single malformed fragment must not fail an entire
+// document's wiki extraction.
 func cleanLLMJSON(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	return sanitizeJSONString(s)
+	if json.Valid([]byte(s)) {
+		return s
+	}
+	if repaired := chatpipeline.RepairJSON(s); repaired != "" {
+		return repaired
+	}
+	return s
+}
+
+// salvageInto attempts to recover a typed struct from a payload that failed
+// the strict JSON unmarshal by extracting its top-level balanced JSON object
+// fragment(s) and unmarshalling the most promising one back into target. It
+// is the wiki postprocess analog of the chunk graph extractor's salvage
+// fallback: a single bad item in a large entity list must not discard the
+// whole extraction. Returns false (and a non-nil error) when nothing usable
+// could be recovered, so callers can keep their original failure path.
+func salvageInto(ctx context.Context, raw string, target interface{}) (bool, error) {
+	maps, err := chatpipeline.SalvageJSONToMaps(raw)
+	if err != nil || len(maps) == 0 {
+		return false, err
+	}
+	// Prefer the fragment carrying the target's expected top-level keys,
+	// otherwise fall back to the first fragment.
+	best := maps[0]
+	if _, ok := target.(*combinedExtraction); ok {
+		for _, m := range maps {
+			if _, hasE := m["entities"]; hasE {
+				best = m
+				break
+			}
+			if _, hasC := m["concepts"]; hasC {
+				best = m
+				break
+			}
+		}
+	} else if _, ok := target.(*citationBatchResult); ok {
+		for _, m := range maps {
+			if _, hasC := m["citations"]; hasC {
+				best = m
+				break
+			}
+		}
+	}
+	bb, mErr := json.Marshal(best)
+	if mErr != nil {
+		return false, mErr
+	}
+	if uErr := json.Unmarshal(bb, target); uErr != nil {
+		return false, uErr
+	}
+	return true, nil
 }
 
 // sanitizeJSONString sanitizes a string that is intended to be parsed as JSON,

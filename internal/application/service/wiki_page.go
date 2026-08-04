@@ -457,17 +457,18 @@ func (s *wikiPageService) GetLog(ctx context.Context, kbID string) (*types.WikiP
 // handler always clamps Limit into a safe range so external traffic can
 // never opt out of truncation.
 //
-// Implementation note: pages are still fetched via repo.ListAll. At 4万
-// pages that's ~10MB of rows + deserialization, which is already on the
-// expensive side but still tractable and keeps the repository interface
-// unchanged. Pushing the filter/top-N down into SQL is a follow-up step
-// (cache layer + DB-side projection) — see CLAUDE.md plan.
+// Implementation note: graph data is fetched via repo.ListAllGraph, a
+// narrow projection that selects only slug/title/page_type/status/in_links/
+// out_links and skips the heavy `content` TEXT column. On a 4万-page wiki
+// this turns the previous full-row scan (hundreds of MB of content) into a
+// lightweight link scan, which is what made the graph view feel slow to
+// load. The top-N / ego subset is still computed in computeGraphSubset.
 func (s *wikiPageService) GetGraph(ctx context.Context, req *types.WikiGraphRequest) (*types.WikiGraphData, error) {
 	if req == nil {
 		return nil, errors.New("wiki graph request is required")
 	}
 
-	pages, err := s.repo.ListAll(ctx, req.KnowledgeBaseID)
+	pages, err := s.repo.ListAllGraph(ctx, req.KnowledgeBaseID)
 	if err != nil {
 		return nil, err
 	}

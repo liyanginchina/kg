@@ -564,6 +564,7 @@ export default {
     statusProcessing: 'Обработка',
     statusFinalizing: 'Оптимизация',
     statusPending: 'Ожидание',
+    statusQueued: 'В очереди на парсинг...',
     statusFailed: 'Ошибка',
     statusCancelled: 'Отменено',
     statusDraft: 'Черновик',
@@ -3829,6 +3830,10 @@ export default {
         instructionsLabel: 'Инструкции генерации вопросов',
         instructionsDescription: 'Задайте аудиторию, сценарий и формулировки, сохраняя стабильный формат вывода',
         instructionsPlaceholder: 'Например: естественные вопросы службы поддержки без экзаменационного стиля…'
+      },
+      maxConcurrentParse: {
+        label: 'Одновременная обработка файлов',
+        description: 'Максимум файлов, обрабатываемых одновременно при пакетной загрузке (1-50, по умолчанию 5); остальные ждут в очереди'
       },
       tableMetadataInstructions: {
         label: 'Инструкции метаданных таблиц',

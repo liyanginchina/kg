@@ -60,6 +60,13 @@ const (
 	// 未来可扩展更多标志位：
 	// ChunkFlagPinned ChunkFlags = 1 << 1  // 置顶
 	// ChunkFlagHot    ChunkFlags = 1 << 2  // 热门
+
+	// ChunkFlagGraphExtracted 表示该 chunk 的图谱抽取结果已成功写入图谱库
+	// （Neo4j AddGraph 已成功）。graph.batch 任务失败重试时以此为断点标记，
+	// 跳过已完成的 chunk，避免整批重新烧一遍 LLM。文档重新解析（re-parse）
+	// 会删除并重建 chunk，标志随之自然归零，不需要额外清理。
+	// 注意 1<<1 / 1<<2 为上面注释预留的扩展位，此处从 1<<3 开始。
+	ChunkFlagGraphExtracted ChunkFlags = 1 << 3
 )
 
 // HasFlag 检查是否设置了指定标志

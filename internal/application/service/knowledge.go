@@ -78,6 +78,11 @@ type knowledgeService struct {
 	// which has a no-op fallback. See knowledge_span_tracker.go.
 	spanTracker SpanTracker
 	audit       interfaces.AuditLogService
+
+	// wikiLogEntryService persists the per-KB wiki change-log feed. Wired
+	// in so deletion can wipe a KB's wiki log entries when it is emptied
+	// or deleted, keeping residual wiki state from lingering.
+	wikiLogEntryService interfaces.WikiLogEntryService
 }
 
 const (
@@ -115,6 +120,7 @@ func NewKnowledgeService(
 	taskPendingRepo interfaces.TaskPendingOpsRepository,
 	spanTracker SpanTracker,
 	audit interfaces.AuditLogService,
+	wikiLogEntryService interfaces.WikiLogEntryService,
 ) (interfaces.KnowledgeService, error) {
 	return &knowledgeService{
 		config:          config,
@@ -144,6 +150,7 @@ func NewKnowledgeService(
 		taskPendingRepo: taskPendingRepo,
 		spanTracker:     spanTracker,
 		audit:           audit,
+		wikiLogEntryService: wikiLogEntryService,
 	}, nil
 }
 

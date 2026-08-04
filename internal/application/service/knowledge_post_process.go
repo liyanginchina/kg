@@ -206,6 +206,11 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	if eff.GraphEnabled {
 		graphChunkCount = len(textChunks)
 	}
+	// Graph extraction is batched: one subtask per window of
+	// graphGenChunkBatchSize text chunks (not one per chunk), so a huge
+	// document doesn't spawn thousands of tiny tasks. The counter must
+	// match exactly how many batch tasks we enqueue below.
+	graphBatchCount := graphBatchCount(graphChunkCount)
 	expectedSubtasks := 0
 	if willSpawnSummary {
 		expectedSubtasks++
@@ -214,7 +219,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	if willSpawnWiki {
 		expectedSubtasks++
 	}
-	expectedSubtasks += graphChunkCount
+	expectedSubtasks += graphBatchCount
 
 	// enteredFinalizing is set only when SetFinalizing actually seeded the
 	// counter (the promoted branch below). It gates the reconciliation that
@@ -325,15 +330,30 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		}
 	}
 
-	// 5. Spawn Graph RAG Tasks — only when graph indexing is enabled in IndexingStrategy
+	// 5. Spawn Graph RAG Tasks — only when graph indexing is enabled in IndexingStrategy.
+	//    Batched: one TypeChunkExtract task per window of graphGenChunkBatchSize text
+	//    chunks (carrying the chunk-id list), so the task count stays bounded for very
+	//    large documents. Each batch task releases exactly one pending_subtasks_count
+	//    slot on terminal exit (see ChunkExtractService.Handle), so enqueuedGraphCount
+	//    here is the number of BATCH tasks, matching graphBatchCount.
 	enqueuedGraphCount := 0
-	if graphChunkCount > 0 {
-		logger.Infof(ctx, "[KnowledgePostProcess] Spawning Graph RAG extract tasks for %d text-like chunks", len(textChunks))
-		for i, chunk := range textChunks {
-			ok, err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, kb.SummaryModelID,
-				payload.KnowledgeID, attempt, i)
+	if graphBatchCount > 0 {
+		logger.Infof(ctx, "[KnowledgePostProcess] Spawning Graph RAG extract tasks for %d text-like chunks in %d batch(es) (batch_size=%d)",
+			graphChunkCount, graphBatchCount, graphGenChunkBatchSize)
+		for start := 0; start < graphChunkCount; start += graphGenChunkBatchSize {
+			end := start + graphGenChunkBatchSize
+			if end > graphChunkCount {
+				end = graphChunkCount
+			}
+			batch := textChunks[start:end]
+			chunkIDs := make([]string, 0, len(batch))
+			for _, c := range batch {
+				chunkIDs = append(chunkIDs, c.ID)
+			}
+			ok, err := NewChunkExtractBatchTask(ctx, s.taskEnqueuer, payload.TenantID, chunkIDs, kb.SummaryModelID,
+				payload.KnowledgeID, attempt, start/graphGenChunkBatchSize)
 			if err != nil {
-				logger.Errorf(ctx, "[KnowledgePostProcess] Failed to create chunk extract task for %s: %v", chunk.ID, err)
+				logger.Errorf(ctx, "[KnowledgePostProcess] Failed to create chunk extract batch task at start=%d: %v", start, err)
 			}
 			if ok {
 				enqueuedGraphCount++
@@ -381,7 +401,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// "finalizing". The bound is per-call (matches the helper) so a wedged
 	// connection can't pin the goroutine for the whole serial loop.
 	if enteredFinalizing {
-		plannedOwned := questionBatchCount + graphChunkCount
+		plannedOwned := questionBatchCount + graphBatchCount
 		if willSpawnSummary {
 			plannedOwned++
 		}
@@ -461,10 +481,43 @@ func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.C
 
 // questionGenChunkBatchSize is the number of text chunks handled by a single
 // question-generation task. Batching keeps the task count bounded for very
-// large documents (a 5k-chunk doc becomes ~250 tasks instead of 5k) while
-// preserving per-batch retry / cancellation granularity and letting each task
-// do one embedding BatchIndex over the whole batch.
-const questionGenChunkBatchSize = 20
+// large documents while preserving per-batch retry / cancellation granularity
+// and letting each task do one embedding BatchIndex over the whole batch.
+//
+// Tuned down from 20 to 5 on 2026-07-28: each batch runs its chunks
+// SEQUENTIALLY and every chunk is one LLM call. Under shared-model contention
+// (the same chat model also serves 32 concurrent graph extractions) a single
+// call can take 1-2 min, so a 20-chunk batch blew past the asynq task Timeout
+// (context deadline exceeded), got killed, and retried forever. With 5 chunks
+// a batch stays well under the timeout even when contended.
+const questionGenChunkBatchSize = 5
+
+// graphGenChunkBatchSize is the number of text chunks handled by a single
+// graph-extract task. Like question generation, batching keeps the graph task
+// count bounded for very large documents, cutting asynq queue depth and
+// FinalizeSubtask DB contention. Each batch still fans out one LLM call per
+// chunk, so total graph work is unchanged; throughput is governed by the
+// graph worker-pool concurrency (DefaultGraphWorkerConcurrency).
+//
+// Tuned down from 20 to 5 on 2026-07-29, mirroring the question batch tuning
+// on 2026-07-28: each batch runs its chunks SEQUENTIALLY and every chunk is
+// one LLM call (~56s/chunk observed under shared-model contention with the
+// graph pool). A 20-chunk batch routinely hit p90=19min and max=30min — the
+// asynq task Timeout — got killed and retried the WHOLE batch from scratch.
+// With 5 chunks a batch stays well under the timeout even when contended.
+const graphGenChunkBatchSize = 5
+
+// graphBatchCount computes how many batch extract tasks a knowledge with
+// textChunkCount text-like chunks should fan out. It MUST match the enqueue
+// loop in Handle exactly, otherwise the seeded pending_subtasks_count will
+// either never reach zero (row stuck in finalizing) or drain prematurely (row
+// completed while graph work is still pending).
+func graphBatchCount(textChunkCount int) int {
+	if textChunkCount <= 0 {
+		return 0
+	}
+	return (textChunkCount + graphGenChunkBatchSize - 1) / graphGenChunkBatchSize
+}
 
 // postprocessQuestionGroupSpanName is the grouping span the per-batch
 // question subspans (postprocess.question.batch[i]) nest under, so the trace
@@ -546,7 +599,7 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationTasks(
 		}
 
 		task := asynq.NewTask(types.TypeQuestionGeneration, payloadBytes,
-			asynq.Queue(types.QueueQuestion), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
+			asynq.Queue(types.QueueQuestion), asynq.MaxRetry(3), asynq.Timeout(60*time.Minute))
 		if _, err := s.taskEnqueuer.Enqueue(task); err != nil {
 			logger.Warnf(ctx, "[KnowledgePostProcess] Failed to enqueue question generation batch %d for %s: %v", batchIndex-1, payload.KnowledgeID, err)
 			continue

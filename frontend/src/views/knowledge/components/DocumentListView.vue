@@ -112,7 +112,14 @@ interface StatusInfo {
   spin?: boolean;
 }
 const computeStatus = (item: KnowledgeItem): StatusInfo => {
-  if (item.parse_status === 'pending' || item.parse_status === 'processing') {
+  // "pending" = queued behind the KB's parse concurrency cap
+  // (ChunkingConfig.MaxConcurrentParse); parsing has NOT started yet.
+  // Show it distinctly from "processing" so batch uploads don't look like
+  // the concurrency limit is being ignored.
+  if (item.parse_status === 'pending') {
+    return { label: t('knowledgeBase.statusQueued'), theme: 'default', icon: 'time' };
+  }
+  if (item.parse_status === 'processing') {
     return { label: t('knowledgeBase.statusProcessing'), theme: 'primary', icon: 'loading', spin: true };
   }
   // finalizing = primary parse done, enrichment subtasks still running.

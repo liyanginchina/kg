@@ -20,8 +20,12 @@ const (
 	// batch by rune count (a fast approximation of token count). Small enough
 	// that batches stay comfortably inside the LLM's context and output
 	// budgets, large enough that most short/medium documents classify in a
-	// single batch. Tune via benchmarks if needed.
-	maxRunesPerCitationBatch = 12000
+	// single batch. The wiki document text is truncated to maxContentForWiki
+	// (32768 runes) before extraction, so 24000 leaves ample headroom for the
+	// candidate-slug XML and prompt scaffolding. Doubling from 12000 -> 24000
+	// roughly halves the number of classify LLM calls per large document —
+	// the dominant LLM cost in postprocess.wiki.
+	maxRunesPerCitationBatch = 24000
 
 	// maxCitationBatchConcurrency limits parallelism across chunk-citation
 	// batches so a single long document can't saturate the synthesis model.
@@ -109,8 +113,15 @@ func (s *wikiIngestService) extractCandidateSlugs(
 
 	var result combinedExtraction
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		logger.Warnf(ctx, "wiki ingest: failed to parse candidate slug JSON: %v\nRaw: %s", err, raw)
-		return nil, nil, nil, fmt.Errorf("parse candidate slug JSON: %w", err)
+		// A single malformed item in a large entity/concept list must not
+		// fail the whole Pass 0. Salvage the well-formed fragments (the
+		// same recovery the chunk graph extractor uses) before giving up.
+		if ok, sErr := salvageInto(ctx, raw, &result); sErr == nil && ok {
+			logger.Warnf(ctx, "wiki ingest: salvaged candidate slug JSON after parse error: %v", err)
+		} else {
+			logger.Warnf(ctx, "wiki ingest: failed to parse candidate slug JSON: %v\nRaw: %s", err, raw)
+			return nil, nil, nil, fmt.Errorf("parse candidate slug JSON: %w", err)
+		}
 	}
 
 	result.Entities, result.Concepts = s.deduplicateExtractedBatch(
@@ -315,8 +326,15 @@ func (s *wikiIngestService) classifyChunkCitations(
 
 			var parsed citationBatchResult
 			if jerr := json.Unmarshal([]byte(raw), &parsed); jerr != nil {
-				logger.Warnf(ectx, "wiki ingest: citation batch %d parse failed: %v\nRaw: %s", batchIdx, jerr, raw)
-				return nil
+				// Don't abort peer batches on a malformed payload; salvage
+				// the well-formed fragments first so one bad chunk doesn't
+				// lose an entire document's citations.
+				if ok, sErr := salvageInto(ectx, raw, &parsed); sErr == nil && ok {
+					logger.Warnf(ectx, "wiki ingest: citation batch %d salvaged JSON after parse error: %v", batchIdx, jerr)
+				} else {
+					logger.Warnf(ectx, "wiki ingest: citation batch %d parse failed: %v\nRaw: %s", batchIdx, jerr, raw)
+					return nil
+				}
 			}
 
 			// Translate aliases → real chunk UUIDs; drop unknown aliases.

@@ -1581,6 +1581,19 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 // postprocess.question.batch[i] subspan. The payload carries only chunk ids
 // (never content); content is read fresh here, and all questions for the batch
 // are indexed in a single embedding BatchIndex call.
+// questionGenLLMCallTimeout / questionGenIndexTimeout are per-call budgets so
+// a single slow or hung LLM / embedding call cannot consume the whole asynq
+// task deadline and kill an otherwise-healthy batch. On timeout the call
+// returns an error: the chunk is skipped (llm_failed++) / the batch logs a
+// warning and retries fast, instead of hanging for the full task Timeout and
+// losing every other chunk's work. Tuned on 2026-07-28 after batches of
+// 9-20 chunks were observed to hit "context deadline exceeded" at the 30-min
+// task deadline under shared-model contention.
+const (
+	questionGenLLMCallTimeout = 10 * time.Minute
+	questionGenIndexTimeout   = 10 * time.Minute
+)
+
 func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Context, t *asynq.Task, payload types.QuestionGenerationPayload) (retErr error) {
 	taskStartedAt := time.Now()
 	retryCount, _ := asynq.GetRetryCount(ctx)
@@ -1877,11 +1890,17 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 
 	indexEntriesPrepared = len(indexInfoList)
 	if len(indexInfoList) > 0 {
-		if err := retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList); err != nil {
+		// Bound the embedding call separately from the asynq task deadline so
+		// a slow vector-store round-trip can't kill the whole batch (and lose
+		// the questions we already generated + stored on the chunks).
+		idxCtx, idxCancel := context.WithTimeout(ctx, questionGenIndexTimeout)
+		idxErr := retrieveEngine.BatchIndex(idxCtx, embeddingModel, indexInfoList)
+		idxCancel()
+		if idxErr != nil {
 			exitStatus = "index_questions_failed"
-			qErr = err
-			logger.Errorf(ctx, "Failed to index generated questions for batch %d: %v", payload.BatchIndex, err)
-			return fmt.Errorf("failed to index questions: %w", err)
+			qErr = idxErr
+			logger.Errorf(ctx, "Failed to index generated questions for batch %d: %v", payload.BatchIndex, idxErr)
+			return fmt.Errorf("failed to index questions: %w", idxErr)
 		}
 		indexBatchSucceeded = true
 		logger.Infof(ctx, "Indexed %d generated questions for knowledge=%s batch=%d",
@@ -1928,7 +1947,13 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 	prompt = types.AppendCustomPromptInstructions(prompt, customInstructions, "question_generation")
 
 	thinking := false
-	response, err := chatModel.Chat(ctx, []chat.Message{
+	// Bound this LLM call independently of the asynq task deadline so a single
+	// slow/hung generation can't eat the whole batch's budget and kill the
+	// other chunks' work (observed: "context deadline exceeded" on the 30-min
+	// task deadline when the shared chat model was contended).
+	callCtx, callCancel := context.WithTimeout(ctx, questionGenLLMCallTimeout)
+	defer callCancel()
+	response, err := chatModel.Chat(callCtx, []chat.Message{
 		{
 			Role:    "user",
 			Content: prompt,
@@ -2776,6 +2801,46 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		return nil
+	}
+
+	// Per-KB parse concurrency cap (configurable in KB advanced settings,
+	// ChunkingConfig.MaxConcurrentParse; default 5). When the KB already has
+	// `limit` documents parsing in this instance, re-schedule the task with a
+	// short jittered delay instead of blocking a core worker slot, so other
+	// KBs / chat-attachment tasks keep flowing.
+	parseLimit := kb.ChunkingConfig.EffectiveMaxConcurrentParse()
+	if !kbParseSlots.tryAcquire(kb.ID, parseLimit) {
+		delay := parseSlotRetryDelay(payload.ParseDeferCount)
+		// Log the first few defers per task at INFO for visibility, then
+		// drop to Debug — a large batch upload otherwise floods the log
+		// with hundreds of thousands of identical cap messages.
+		logf := logger.Debugf
+		if payload.ParseDeferCount < 3 {
+			logf = logger.Infof
+		}
+		logf(ctx,
+			"KB %s at parse concurrency cap (%d in use, limit %d), deferring knowledge %s by %s (defer #%d)",
+			kb.ID, kbParseSlots.inUse(kb.ID), parseLimit, knowledge.ID, delay, payload.ParseDeferCount+1)
+		deferredPayload := payload
+		deferredPayload.ParseDeferCount++
+		payloadBytes, mErr := json.Marshal(deferredPayload)
+		if mErr != nil {
+			payloadBytes = t.Payload() // fallback: keep original payload (no backoff growth)
+		}
+		deferred := asynq.NewTask(
+			types.TypeDocumentProcess,
+			payloadBytes,
+			documentProcessTaskOptions(s.config, asynq.MaxRetry(3), asynq.ProcessIn(delay))...,
+		)
+		if _, err := s.task.Enqueue(deferred); err != nil {
+			// Could not re-schedule: fall back to running now rather than
+			// losing the document (cap becomes best-effort in this edge case).
+			logger.Errorf(ctx, "failed to defer parse task for knowledge %s: %v; proceeding without slot", knowledge.ID, err)
+		} else {
+			return nil
+		}
+	} else {
+		defer kbParseSlots.release(kb.ID)
 	}
 
 	processOverrides, _ := knowledge.ProcessOverrides()

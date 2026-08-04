@@ -921,6 +921,25 @@ func (r *wikiPageRepository) ListAll(ctx context.Context, kbID string) ([]*types
 	return pages, nil
 }
 
+// ListAllGraph is the graph-optimized variant of ListAll. It projects only
+// the columns the knowledge-graph endpoints need (slug, title, page_type,
+// status, in_links, out_links) and skips the `content` TEXT column, which is
+// by far the largest payload on a wiki with tens of thousands of pages. The
+// graph subset computation (computeGraphSubset / bfsEgoSlugs) never reads
+// content, so dropping it cuts the per-request scan from hundreds of MB to a
+// narrow link scan without changing graph semantics.
+func (r *wikiPageRepository) ListAllGraph(ctx context.Context, kbID string) ([]*types.WikiPage, error) {
+	var pages []*types.WikiPage
+	if err := r.db.WithContext(ctx).
+		Model(&types.WikiPage{}).
+		Select("slug", "title", "page_type", "status", "in_links", "out_links").
+		Where("knowledge_base_id = ?", kbID).
+		Find(&pages).Error; err != nil {
+		return nil, err
+	}
+	return pages, nil
+}
+
 // ListRecentForSuggestions returns recent user-visible wiki pages across the given
 // knowledge bases, used as a fallback source for agent suggested questions when
 // the KB has no FAQ entries or AI-generated document questions (typical for

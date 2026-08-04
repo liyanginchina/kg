@@ -177,6 +177,15 @@ func NewExtractor(
 	}
 }
 
+// ErrGraphParseFailed marks an Extract failure that happened AFTER the LLM
+// call succeeded — the model returned content but it could not be parsed into
+// GraphData even after repairJSON/salvageFragments. Unlike transport errors,
+// retrying the same prompt against the same model is very likely to produce
+// the same malformed output, so callers should treat this as deterministic:
+// degrade (e.g. empty graph for the chunk) instead of burning asynq retries.
+// Detect it with errors.Is(err, ErrGraphParseFailed).
+var ErrGraphParseFailed = errors.New("graph output parse failed")
+
 // Extract extracts entities from content
 func (e *Extractor) Extract(ctx context.Context, content string) (*types.GraphData, error) {
 	generator := NewQAPromptGenerator(e.formater, e.template)
@@ -193,7 +202,7 @@ func (e *Extractor) Extract(ctx context.Context, content string) (*types.GraphDa
 	graph, err := e.formater.ParseGraph(ctx, chatResponse.Content)
 	if err != nil {
 		logger.Errorf(ctx, "failed to parse graph: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrGraphParseFailed, err)
 	}
 	// e.RemoveUnknownRelation(ctx, graph)
 	return graph, nil
@@ -384,10 +393,41 @@ func (f *Formater) parseOutput(ctx context.Context, text string) ([]map[string]i
 		return nil, errors.New("empty or invalid input string")
 	}
 
+	if f.formatType == FormatTypeJSON {
+		// The graph-extraction model (e.g. DeepSeek via the chinalco gateway)
+		// frequently emits non-strict JSON: unescaped newlines / tabs inside
+		// string values, stray trailing characters after the closing bracket
+		// (e.g. ')'), leading prose before the first bracket, trailing commas,
+		// several concatenated JSON objects without a wrapping array, or
+		// arbitrary special characters / mojibake ('<', '>', '(', non-ASCII,
+		// markdown/HTML fragments, etc.) leaked into structural positions.
+		// Normalize every one of those defects before the strict unmarshal so
+		// a single malformed chunk does not fail the whole graph extraction
+		// task.
+		if repaired := repairJSON(content); repaired != "" {
+			content = repaired
+		}
+	}
+
 	var parsed interface{}
 	var err error
 	if f.formatType == FormatTypeJSON {
 		err = json.Unmarshal([]byte(content), &parsed)
+		if err != nil {
+			// The strict unmarshal failed even after repairJSON normalized the
+			// common defects. The graph-extraction model (e.g. DeepSeek via the
+			// chinalco gateway) sometimes emits a payload where ONE fragment is
+			// malformed — an unterminated string, a stray quote, or a special
+			// character that corrupts the structural state — while the rest of
+			// the payload is perfectly good. Salvage the well-formed fragments
+			// instead of failing the whole chunk; a single bad item must not
+			// discard an entire document's graph extraction.
+			if salvaged, sErr := salvageFragments(content); sErr == nil && len(salvaged) > 0 {
+				logger.Warnf(ctx, "graph JSON salvage recovered %d fragment(s) after parse error: %v", len(salvaged), err)
+				parsed = salvaged
+				err = nil
+			}
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse %s content: %s", strings.ToUpper(string(f.formatType)), err.Error())
@@ -410,10 +450,565 @@ func (f *Formater) parseOutput(ctx context.Context, text string) ([]map[string]i
 		if itemMap, ok := item.(map[string]interface{}); ok {
 			itemsList = append(itemsList, itemMap)
 		} else {
-			return nil, fmt.Errorf("each item in the sequence must be a mapping.")
+			// Best-effort: skip a non-mapping element (e.g. a bare string or
+			// number the model emitted inside the list) instead of failing
+			// the entire extraction. The well-formed entries are still
+			// usable for graph construction.
+			logger.Warnf(ctx, "skipping non-mapping item in extraction sequence: %T", item)
 		}
 	}
 	return itemsList, nil
+}
+
+// trailingCommaRE matches a comma immediately preceding a closing brace or
+// bracket. JSON forbids trailing commas, and LLMs emit them often; stripping
+// them is safe because a comma can never be valid immediately before '}'/']'.
+var trailingCommaRE = regexp.MustCompile(`,\s*([}\]])`)
+
+// repairJSON normalizes the most common LLM-produced JSON defects that the
+// strict encoding/json package rejects. It first trims the payload to its
+// outermost balanced object/array (dropping any leading prose and trailing
+// junk such as ')', stray braces, or explanatory text), then escapes
+// unescaped control characters inside JSON string literals and removes
+// trailing commas. It returns an empty string when nothing parseable can be
+// recovered, so callers can keep their original error path.
+//
+// This is intentionally conservative: it only rewrites content inside string
+// literals and trims to a balanced container — valid JSON passes through
+// untouched.
+func repairJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	trimmed := extractTopLevelJSON(s)
+	if trimmed == "" {
+		// No balanced JSON container found; nothing to repair.
+		return ""
+	}
+	s = trimmed
+	s = sanitizeJSONStrings(s)
+	// Drop non-ASCII runes that leaked into structural positions (between
+	// JSON tokens). In valid JSON every non-ASCII rune lives inside a string
+	// value (UTF-8), so a non-ASCII rune outside a string literal is either
+	// encoding corruption (mojibake, e.g. the chinalco gateway returning
+	// Latin-1 bytes) or stray prose the model emitted between array/object
+	// elements. Discarding it lets json.Unmarshal proceed instead of failing
+	// with "invalid character 'ä' after array element".
+	s = stripStructuralGarbage(s)
+	// LLMs frequently concatenate values without the separating comma (e.g.
+	// several objects inside an array with prose in between, or a trailing
+	// comma that was already stripped). After garbage removal, re-insert a
+	// comma between any two adjacent values so the payload is valid JSON.
+	s = insertMissingCommas(s)
+	s = trailingCommaRE.ReplaceAllString(s, "$1")
+	return s
+}
+
+// extractTopLevelJSON returns the outermost balanced JSON value(s) from s,
+// respecting string literals so braces/brackets inside strings do not
+// unbalance the scan. When several top-level values are concatenated (e.g.
+// the model emitted multiple JSON objects without a wrapping array), they are
+// joined into a single JSON array so the result stays parseable as a list.
+// It returns an empty string when no balanced value can be found.
+func extractTopLevelJSON(s string) string {
+	var values []string
+	inString := false
+	escaped := false
+	depth := 0
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}', ']':
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 {
+					values = append(values, s[start:i+1])
+					start = -1
+				}
+			}
+		}
+	}
+	switch len(values) {
+	case 0:
+		return ""
+	case 1:
+		return strings.TrimSpace(values[0])
+	default:
+		// Concatenated top-level values -> wrap them in an array.
+		return "[" + strings.Join(values, ",") + "]"
+	}
+}
+
+// extractTopLevelFragments returns every top-level balanced JSON value
+// (object or array) found in s, respecting string literals so that braces and
+// brackets inside strings do not unbalance the scan. Unlike extractTopLevelJSON
+// it does NOT join the fragments into a single array — the caller decides how
+// to interpret each one independently. It returns an empty slice when no
+// balanced value can be found.
+func extractTopLevelFragments(s string) []string {
+	var frags []string
+	inString := false
+	escaped := false
+	depth := 0
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}', ']':
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 {
+					frags = append(frags, s[start:i+1])
+					start = -1
+				}
+			}
+		}
+	}
+	return frags
+}
+
+// salvageFragments attempts to recover usable graph data from a payload that
+// failed the strict JSON unmarshal. It splits the payload into top-level
+// balanced fragments and unmarshals each one; objects are kept as-is, arrays
+// contribute their (mapping) elements. When an array fragment fails to unmarshal
+// as a whole — e.g. because one of its elements is malformed — it falls back to
+// salvaging each array element individually. The result is a flat list of
+// mapping items, exactly what parseOutput expects downstream. It returns an
+// error (and no items) only when nothing usable could be recovered.
+func salvageFragments(content string) ([]interface{}, error) {
+	frags := extractTopLevelFragments(content)
+	collected := make([]interface{}, 0)
+	for _, frag := range frags {
+		trimmed := strings.TrimSpace(frag)
+		var v interface{}
+		if err := json.Unmarshal([]byte(trimmed), &v); err == nil {
+			switch val := v.(type) {
+			case map[string]interface{}:
+				collected = append(collected, val)
+			case []interface{}:
+				collected = append(collected, val...)
+			}
+			continue
+		}
+		// A top-level array that fails as a whole may still contain good
+		// elements — try to salvage them one by one.
+		if strings.HasPrefix(trimmed, "[") {
+			if elems, e2 := salvageArrayElements(trimmed); e2 == nil {
+				collected = append(collected, elems...)
+			}
+		}
+	}
+	if len(collected) == 0 {
+		return nil, errors.New("no salvageable JSON fragments")
+	}
+	return collected, nil
+}
+
+// salvageArrayElements salvages the individual elements of a top-level JSON
+// array whose whole-array unmarshal failed. It scans the array body for
+// top-level balanced elements (string-aware) and unmarshals each; malformed
+// elements are skipped. It returns an error when no element could be recovered.
+func salvageArrayElements(frag string) ([]interface{}, error) {
+	inner := strings.TrimSpace(frag)
+	if len(inner) < 2 || inner[0] != '[' || inner[len(inner)-1] != ']' {
+		return nil, errors.New("not an array fragment")
+	}
+	body := inner[1 : len(inner)-1]
+	var elems []interface{}
+	inString := false
+	escaped := false
+	depth := 0
+	start := -1
+	flush := func(end int) {
+		if start < 0 {
+			return
+		}
+		elem := strings.TrimSpace(body[start:end])
+		start = -1
+		if elem == "" {
+			return
+		}
+		var v interface{}
+		if json.Unmarshal([]byte(elem), &v) == nil {
+			elems = append(elems, v)
+		}
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}', ']':
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 {
+					flush(i + 1)
+				}
+			}
+		case ',':
+			if depth == 0 {
+				flush(i)
+			}
+		}
+	}
+	flush(len(body))
+	if len(elems) == 0 {
+		return nil, errors.New("no salvageable array elements")
+	}
+	return elems, nil
+}
+
+// sanitizeJSONStrings walks the input character by character and escapes
+// control characters that are illegal inside JSON string literals but which
+// LLMs frequently emit verbatim (raw newlines, tabs, carriage returns, and
+// other sub-0x20 bytes). Tokens outside of string literals are left
+// untouched, so legitimate whitespace between JSON elements is preserved.
+func sanitizeJSONStrings(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inString := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if escaped {
+				b.WriteByte(c)
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				b.WriteByte(c)
+				escaped = true
+			case '"':
+				b.WriteByte(c)
+				inString = false
+			case '\n':
+				b.WriteString(`\n`)
+			case '\r':
+				b.WriteString(`\r`)
+			case '\t':
+				b.WriteString(`\t`)
+			default:
+				if c < 0x20 {
+					b.WriteString(fmt.Sprintf(`\u%04x`, c))
+				} else {
+					b.WriteByte(c)
+				}
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			b.WriteByte(c)
+			inString = true
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// stripStructuralGarbage removes every character that is NOT part of valid
+// JSON structure when it appears OUTSIDE a string literal. In well-formed
+// JSON the only things allowed outside strings are: whitespace, the
+// structural punctuation {}[]:, the value delimiters ("), number characters,
+// and the literals true/false/null. Anything else outside a string —
+// stray prose, markdown/HTML tags such as '<' or '>', parentheses, slashes,
+// asterisks, non-ASCII mojibake like 'ä'/'é'/'å', etc. — is corruption or
+// commentary the model emitted between JSON elements and is safe to drop.
+//
+// Characters INSIDE string literals are preserved untouched, so legitimate
+// UTF-8 text and punctuation in entity/relation names (e.g. an entity whose
+// name contains '<' or a Chinese character) survive intact.
+//
+// This generalizes the earlier "non-ASCII only" filter so that the full
+// alphabet of special characters the graph model has been observed to leak
+// into structural positions is tolerated.
+func stripStructuralGarbage(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inString := false
+	escaped := false
+	i := 0
+	n := len(s)
+	for i < n {
+		c := s[i]
+		if inString {
+			if escaped {
+				b.WriteByte(c)
+				escaped = false
+				i++
+				continue
+			}
+			if c == '\\' {
+				b.WriteByte(c)
+				escaped = true
+				i++
+				continue
+			}
+			if c == '"' {
+				b.WriteByte(c)
+				inString = false
+				i++
+				continue
+			}
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		switch {
+		case c == '"':
+			b.WriteByte(c)
+			inString = true
+			i++
+		case c == '{' || c == '}' || c == '[' || c == ']' || c == ':' || c == ',':
+			b.WriteByte(c)
+			i++
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			b.WriteByte(c)
+			i++
+		case isJSONNumberByte(c):
+			// Keep a whole number run (digits and . + - e E).
+			j := i
+			for j < n && isJSONNumberByte(s[j]) {
+				j++
+			}
+			b.WriteString(s[i:j])
+			i = j
+		case isASCIILetter(c):
+			// Could be a true/false/null literal, or stray prose. Keep only
+			// the exact literals; drop everything else.
+			j := i
+			for j < n && isASCIILetter(s[j]) {
+				j++
+			}
+			word := s[i:j]
+			if word == "true" || word == "false" || word == "null" {
+				b.WriteString(word)
+			}
+			i = j
+		default:
+			// Any other byte outside a string literal: drop it. This covers
+			// '<', '>', '(', ')', '/', '*', '#', '@', '=', non-ASCII multibyte
+			// starts (>= 0x80), and any other junk the model produced.
+			i++
+		}
+	}
+	return b.String()
+}
+
+// RepairJSON exposes the internal repairJSON normalization to other packages
+// (notably the wiki postprocess module) so a single, battle-tested LLM-JSON
+// hardener is shared across every graph/entity extraction path instead of
+// being re-implemented per caller. It returns an empty string when nothing
+// parseable can be recovered.
+func RepairJSON(s string) string {
+	return repairJSON(s)
+}
+
+// SalvageJSONToMaps exposes the internal salvageFragments recovery to other
+// packages. It splits a payload that failed a strict unmarshal into its
+// top-level balanced JSON object/array fragments and returns only the object
+// fragments as maps — exactly what downstream callers need to reconstruct a
+// typed struct via json.Marshal/Unmarshal. It returns an error (and no maps)
+// only when nothing usable could be recovered.
+func SalvageJSONToMaps(s string) ([]map[string]interface{}, error) {
+	items, err := salvageFragments(s)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, it := range items {
+		if m, ok := it.(map[string]interface{}); ok {
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no salvageable JSON fragments")
+	}
+	return out, nil
+}
+
+// isJSONNumberByte reports whether b may appear inside a JSON number token.
+func isJSONNumberByte(b byte) bool {
+	switch {
+	case b >= '0' && b <= '9':
+		return true
+	case b == '.' || b == '-' || b == '+' || b == 'e' || b == 'E':
+		return true
+	}
+	return false
+}
+
+// isASCIILetter reports whether b is an ASCII letter (a-z, A-Z).
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// insertMissingCommas re-inserts the comma that separates two adjacent JSON
+// values when the model omitted it — a common defect when several objects or
+// strings are concatenated inside an array (or several top-level values) with
+// prose in between. It only acts in structural positions: when the previous
+// non-whitespace token closed a value ('}', ']' or a string) and the next
+// token opens a new value ('{', '[', '"', a digit, or a true/false/null
+// literal), a comma is inserted. Valid JSON never places a value directly
+// after another value without a comma, so this is a no-op on well-formed
+// input and cannot produce invalid output.
+func insertMissingCommas(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inString := false
+	escaped := false
+	// prev holds the last structural token seen outside a string: '}' or ']'
+	// (a value just closed) or '"' (a string value just closed). The zero
+	// value means "no value-closing token pending".
+	prev := rune(0)
+	i := 0
+	n := len(s)
+	for i < n {
+		c := s[i]
+		if inString {
+			if escaped {
+				b.WriteByte(c)
+				escaped = false
+				i++
+				continue
+			}
+			if c == '\\' {
+				b.WriteByte(c)
+				escaped = true
+				i++
+				continue
+			}
+			if c == '"' {
+				b.WriteByte(c)
+				inString = false
+				prev = '"'
+				i++
+				continue
+			}
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		switch {
+		case c == '"':
+			if prev == '}' || prev == ']' || prev == '"' {
+				b.WriteByte(',')
+			}
+			b.WriteByte(c)
+			inString = true
+			prev = 0
+			i++
+		case c == '{' || c == '[':
+			if prev == '}' || prev == ']' || prev == '"' {
+				b.WriteByte(',')
+			}
+			b.WriteByte(c)
+			prev = 0
+			i++
+		case c >= '0' && c <= '9':
+			if prev == '}' || prev == ']' || prev == '"' {
+				b.WriteByte(',')
+			}
+			// Keep a whole number run (digits and . + - e E).
+			j := i
+			for j < n && isJSONNumberByte(s[j]) {
+				j++
+			}
+			b.WriteString(s[i:j])
+			i = j
+			prev = 0
+		case isASCIILetter(c):
+			// Whole word run. stripStructuralGarbage already dropped every
+			// letter run that is not a literal, so the only surviving runs
+			// here are true/false/null. Preserve the whole word (the rune-by-
+			// rune path would truncate them to their first letter).
+			j := i
+			for j < n && isASCIILetter(s[j]) {
+				j++
+			}
+			word := s[i:j]
+			if word == "true" || word == "false" || word == "null" {
+				if prev == '}' || prev == ']' || prev == '"' {
+					b.WriteByte(',')
+				}
+				b.WriteString(word)
+			}
+			i = j
+			prev = 0
+		case c == '}' || c == ']':
+			b.WriteByte(c)
+			prev = rune(c)
+			i++
+		case c == ',' || c == ':':
+			b.WriteByte(c)
+			prev = 0
+			i++
+		default:
+			// Whitespace: preserve but do not reset the pending value-closer
+			// (it still applies once the next value-start token appears).
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				b.WriteByte(c)
+			}
+			// Any other non-ASCII/structural junk was already removed by
+			// stripStructuralGarbage; other ASCII punctuation here is dropped.
+			i++
+		}
+	}
+	return b.String()
 }
 
 func (f *Formater) ParseGraph(ctx context.Context, text string) (*types.GraphData, error) {

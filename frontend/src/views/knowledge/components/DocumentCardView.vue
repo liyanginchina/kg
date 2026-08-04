@@ -104,6 +104,13 @@ const inFlightCardStatusText = (item: KnowledgeCard): string => {
     }
     return t('knowledgeBase.statusFinalizing');
   }
+  // "pending" means the document is queued behind the KB's parse concurrency
+  // cap (ChunkingConfig.MaxConcurrentParse) and has NOT started parsing yet.
+  // Showing it as "parsing" made batch uploads look like the concurrency
+  // limit was being ignored (all files appeared in-flight at once).
+  if (item.parse_status === 'pending') {
+    return t('knowledgeBase.statusQueued');
+  }
   return t('knowledgeBase.parsingInProgress');
 };
 

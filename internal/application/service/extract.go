@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -124,6 +125,60 @@ func NewChunkExtractTask(
 	return true, nil
 }
 
+// NewChunkExtractBatchTask enqueues ONE graph-extract task covering a window
+// of chunkIDs (batched fan-out). It returns (enqueued, err): enqueued is true
+// only when a task was actually placed on the queue. When NEO4J is disabled
+// the call is a no-op and returns (false, nil) — callers that seeded a
+// pending-subtask slot for this batch MUST release that slot, otherwise the
+// parent knowledge stays stuck in "finalizing" forever.
+//
+// Batching keeps the graph task count bounded for very large documents (a
+// 400-chunk doc becomes ~20 tasks instead of 400), cutting asynq queue depth
+// and FinalizeSubtask DB contention. Each batch still fans out one LLM call
+// per chunk, so total graph work is unchanged; throughput is governed by the
+// graph worker-pool concurrency. The handler calls FinalizeSubtask exactly
+// once per batch on terminal exit.
+func NewChunkExtractBatchTask(
+	ctx context.Context,
+	client interfaces.TaskEnqueuer,
+	tenantID uint64,
+	chunkIDs []string,
+	modelID string,
+	knowledgeID string,
+	attempt int,
+	batchIndex int,
+) (bool, error) {
+	if len(chunkIDs) == 0 {
+		return false, nil
+	}
+	if strings.ToLower(os.Getenv("NEO4J_ENABLE")) != "true" {
+		logger.Warn(ctx, "NEO4J is not enabled, skip chunk extract batch task")
+		return false, nil
+	}
+	taskPayload := types.ExtractChunkPayload{
+		TenantID:    tenantID,
+		ModelID:     modelID,
+		KnowledgeID: knowledgeID,
+		Attempt:     attempt,
+		ChunkIDs:    chunkIDs,
+		BatchIndex:  batchIndex,
+	}
+	langfuse.InjectTracing(ctx, &taskPayload)
+	payload, err := json.Marshal(taskPayload)
+	if err != nil {
+		return false, err
+	}
+	task := asynq.NewTask(types.TypeChunkExtract, payload,
+		asynq.Queue(types.QueueGraph), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
+	info, err := client.Enqueue(task)
+	if err != nil {
+		logger.Errorf(ctx, "failed to enqueue batch task: %v", err)
+		return false, fmt.Errorf("failed to enqueue batch task: %v", err)
+	}
+	logger.Infof(ctx, "enqueued batch task: id=%s queue=%s batch=%d chunks=%d", info.ID, info.Queue, batchIndex, len(chunkIDs))
+	return true, nil
+}
+
 // NewTableExtractTask creates a new table extract task
 func NewDataTableSummaryTask(
 	ctx context.Context,
@@ -198,7 +253,14 @@ func (s *ChunkExtractService) tracker() SpanTracker {
 	return s.spanTracker
 }
 
-// Handle handles the chunk extraction task
+// Handle handles the chunk extraction task. It supports two payload shapes:
+//   - batch mode (ChunkIDs set): extracts graph data for an ordered window of
+//     chunks, calling FinalizeSubtask exactly once on terminal exit.
+//   - legacy single-chunk mode (ChunkID set): extracts one chunk.
+//
+// Batch mode is the default for new enqueues (NewChunkExtractBatchTask); the
+// single-chunk branch keeps interim per-chunk tasks enqueued before batching
+// shipped still running to completion.
 func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	var p types.ExtractChunkPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -206,46 +268,62 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 	ctx = logger.WithRequestID(ctx, uuid.New().String())
-	ctx = logger.WithField(ctx, "extract", p.ChunkID)
+
+	// Resolve the chunk-id window this task owns: batch mode carries a
+	// ChunkIDs list; legacy single-chunk tasks carry ChunkID only.
+	chunkIDs := p.ChunkIDs
+	if len(chunkIDs) == 0 && p.ChunkID != "" {
+		chunkIDs = []string{p.ChunkID}
+	}
+	if len(chunkIDs) == 0 {
+		logger.Warnf(ctx, "graph extract: task has no chunk ids, skipping")
+		return nil
+	}
+
+	ctx = logger.WithField(ctx, "extract", strings.Join(chunkIDs, ","))
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, p.TenantID)
 
 	// A newer attempt (re-upload / edit / reparse) has superseded this one:
 	// skip before opening the span or registering the FinalizeSubtask defer.
-	// The chunk this task references was deleted by the new attempt's cleanup,
-	// and decrementing here would drain the new attempt's counter.
+	// The chunks this task references were deleted by the new attempt's
+	// cleanup, and decrementing here would drain the new attempt's counter.
 	if attemptSuperseded(ctx, s.tracker(), p.KnowledgeID, p.Attempt) {
 		logger.Infof(ctx, "graph extract: attempt %d superseded for %s, skipping stale enrichment",
 			p.Attempt, p.KnowledgeID)
 		return nil
 	}
 
-	// Open a postprocess subspan keyed by chunk ordinal so the trace
-	// shows real per-chunk graph extraction time. Skipped silently when
-	// upstream didn't pass the parent attempt (legacy in-flight tasks)
-	// or when the postprocess stage span isn't found.
+	// Open a postprocess subspan for this task (batch or single-chunk).
+	// Skipped silently when upstream didn't pass the parent attempt (legacy
+	// in-flight tasks) or when the postprocess stage span isn't found.
 	var gSpan *Span
 	if p.KnowledgeID != "" && p.Attempt > 0 {
 		parent := s.tracker().LookupStage(ctx, p.KnowledgeID, p.Attempt, types.StagePostProcess)
 		if parent != nil {
-			gSpan = s.tracker().BeginSubSpan(ctx, parent,
-				fmt.Sprintf("postprocess.graph.chunk[%d]", p.ChunkIndex),
+			name := fmt.Sprintf("postprocess.graph.batch[%d]", p.BatchIndex)
+			if len(p.ChunkIDs) == 0 {
+				name = fmt.Sprintf("postprocess.graph.chunk[%d]", p.ChunkIndex)
+			}
+			gSpan = s.tracker().BeginSubSpan(ctx, parent, name,
 				types.SpanKindSubSpan,
 				types.JSONMap{
-					"chunk_id":    p.ChunkID,
-					"chunk_index": p.ChunkIndex,
-					"model_id":    p.ModelID,
+					"knowledge_id": p.KnowledgeID,
+					"batch_index":  p.BatchIndex,
+					"chunk_count":  len(chunkIDs),
+					"model_id":     p.ModelID,
 				})
 		}
 	}
 	var handleErr error
 	graphOut := types.JSONMap{}
 	defer func() {
-		// Decrement the parent's enrichment counter on terminal exit so a
-		// completed (or terminally-failed) per-chunk extract releases its
-		// slot in pending_subtasks_count. KnowledgeID is the new (post-#? )
-		// payload field; legacy in-flight tasks without it are skipped.
+		// Decrement the parent's enrichment counter ONCE on terminal exit,
+		// regardless of how many chunks this task covered. For batch mode
+		// this is one release per batch; for legacy single-chunk mode it is
+		// one release per chunk. KnowledgeID is the field added post-#? ;
+		// legacy in-flight tasks without it are skipped by the helper.
 		finalizeSubtaskDetached(ctx, s.knowledgeRepo, p.KnowledgeID,
-			fmt.Sprintf("graph_chunk[%d]", p.ChunkIndex),
+			fmt.Sprintf("graph_batch[%d]", p.BatchIndex),
 			handleErr, false, isFinalAsynqAttempt(ctx))
 		if gSpan == nil {
 			return
@@ -258,39 +336,123 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	}()
 
 	// Short-circuit when the parent knowledge has been cancelled / deleted.
-	// Each graph extract is per-chunk and runs one LLM call — the most
-	// expensive enrichment fan-out in the pipeline. Skipping on cancel
-	// is the whole point of the finalizing-state machinery above.
+	// Graph extraction runs one LLM call per chunk — the most expensive
+	// enrichment fan-out in the pipeline. Skipping on cancel is the whole
+	// point of the finalizing-state machinery above.
 	if p.KnowledgeID != "" && s.knowledgeRepo != nil {
 		if k, kerr := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, p.KnowledgeID); kerr == nil && k != nil {
 			switch k.ParseStatus {
 			case types.ParseStatusCancelled, types.ParseStatusDeleting:
-				logger.Infof(ctx, "graph extract: knowledge %s aborted (%s), skipping chunk %s",
-					p.KnowledgeID, k.ParseStatus, p.ChunkID)
+				logger.Infof(ctx, "graph extract: knowledge %s aborted (%s), skipping batch of %d chunks",
+					p.KnowledgeID, k.ParseStatus, len(chunkIDs))
 				graphOut["skipped"] = "knowledge_" + k.ParseStatus
 				return nil
 			}
 		}
 	}
 
-	chunk, err := s.chunkRepo.GetChunkByID(ctx, p.TenantID, p.ChunkID)
+	// Per-chunk extraction loop. Each chunk is an independent LLM call.
+	// Failure isolation: a failed chunk no longer aborts the rest of the
+	// batch — the remaining chunks still run (and checkpoint their success
+	// via ChunkFlagGraphExtracted), then the task returns an aggregate error
+	// so asynq retries the batch. On retry the checkpoint skips every chunk
+	// that already succeeded, so only the failed chunks re-run instead of
+	// the whole batch re-burning one LLM call per chunk.
+	var totalNodes, totalRelations int
+	var failedChunks []string
+	var firstErr error
+	for _, chunkID := range chunkIDs {
+		chunkOut, err := s.extractGraphForChunk(ctx, p, chunkID)
+		if err != nil {
+			// Context cancelled / deadline exceeded: every remaining chunk
+			// would fail the same way — abort immediately and let asynq
+			// retry the batch (checkpointed chunks are skipped on retry).
+			if ctx.Err() != nil {
+				handleErr = ctx.Err()
+				return handleErr
+			}
+			logger.Warnf(ctx, "graph extract: chunk %s failed, continuing with rest of batch: %v",
+				chunkID, err)
+			failedChunks = append(failedChunks, chunkID)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if n, ok := chunkOut["nodes_added"].(int); ok {
+			totalNodes += n
+		}
+		if r, ok := chunkOut["relations_added"].(int); ok {
+			totalRelations += r
+		}
+		// Preserve the single-chunk trace fields for legacy tasks only.
+		if len(p.ChunkIDs) == 0 {
+			if v, ok := chunkOut["chunk_chars"]; ok {
+				graphOut["chunk_chars"] = v
+			}
+			if v, ok := chunkOut["chunk_preview"]; ok {
+				graphOut["chunk_preview"] = v
+			}
+		}
+	}
+	graphOut["chunk_count"] = len(chunkIDs)
+	graphOut["nodes_added"] = totalNodes
+	graphOut["relations_added"] = totalRelations
+	if firstErr != nil {
+		graphOut["chunks_failed"] = len(failedChunks)
+		handleErr = fmt.Errorf("graph extract failed for %d/%d chunks (first failed: %s): %w",
+			len(failedChunks), len(chunkIDs), failedChunks[0], firstErr)
+		return handleErr
+	}
+	return nil
+}
+
+// markGraphExtracted sets the ChunkFlagGraphExtracted checkpoint on the chunk
+// (best-effort). A failure to persist the flag is logged but never fails the
+// extraction — the worst case is one redundant LLM call on a future retry,
+// which is exactly the pre-checkpoint behavior.
+func (s *ChunkExtractService) markGraphExtracted(ctx context.Context, tenantID uint64, chunk *types.Chunk) {
+	if chunk == nil {
+		return
+	}
+	if err := s.chunkRepo.UpdateChunkFlagsBatch(ctx, tenantID, chunk.KnowledgeBaseID,
+		map[string]types.ChunkFlags{chunk.ID: types.ChunkFlagGraphExtracted}, nil); err != nil {
+		logger.Warnf(ctx, "graph extract: failed to persist graph-extracted checkpoint for chunk %s: %v",
+			chunk.ID, err)
+	}
+}
+
+// extractGraphForChunk runs the graph extraction LLM call for a single chunk
+// and writes the result to the graph store. It is the unit of work shared by
+// both legacy single-chunk tasks (ChunkID set) and new batched tasks
+// (ChunkIDs set): the caller loops over the window and aggregates counts. A
+// non-nil error means this chunk failed and the whole task should be retried
+// by asynq.
+func (s *ChunkExtractService) extractGraphForChunk(ctx context.Context, p types.ExtractChunkPayload, chunkID string) (types.JSONMap, error) {
+	out := types.JSONMap{}
+	chunk, err := s.chunkRepo.GetChunkByID(ctx, p.TenantID, chunkID)
 	if err != nil {
-		logger.Errorf(ctx, "failed to get chunk: %v", err)
-		handleErr = err
-		return err
+		logger.Errorf(ctx, "failed to get chunk %s: %v", chunkID, err)
+		return out, err
 	}
-	// Capture chunk content shape on output — lets traces answer "WHAT
-	// did the LLM call see?" without joining back to the chunk store.
-	// Preview is truncated to keep span rows reasonable.
-	if gSpan != nil {
-		graphOut["chunk_chars"] = len([]rune(chunk.Content))
-		graphOut["chunk_preview"] = previewText(chunk.Content, 200)
+	// Checkpoint: this chunk's graph was already written to the graph store
+	// by an earlier (partially failed) run of the batch. Skip it instead of
+	// re-burning the LLM call — the retry only needs the failed chunks.
+	// Re-parsed documents delete + recreate their chunks, so the flag
+	// naturally resets and never suppresses a legitimate re-extraction.
+	if chunk.Flags.HasFlag(types.ChunkFlagGraphExtracted) {
+		logger.Infof(ctx, "graph extract: chunk %s already extracted (checkpoint), skipping", chunkID)
+		out["skipped"] = "already_extracted"
+		return out, nil
 	}
+	// Capture chunk content shape on output — lets traces answer "WHAT did
+	// the LLM call see?" without joining back to the chunk store.
+	out["chunk_chars"] = len([]rune(chunk.Content))
+	out["chunk_preview"] = previewText(chunk.Content, 200)
 	kb, err := s.knowledgeBaseRepo.GetKnowledgeBaseByID(ctx, chunk.KnowledgeBaseID)
 	if err != nil {
-		logger.Errorf(ctx, "failed to get knowledge base: %v", err)
-		handleErr = err
-		return err
+		logger.Errorf(ctx, "failed to get knowledge base %s: %v", chunk.KnowledgeBaseID, err)
+		return out, err
 	}
 
 	var processOverrides *types.KnowledgeProcessOverrides
@@ -305,16 +467,15 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	}
 	extractCfg := ResolveProcessConfig(kb, processOverrides).ExtractConfig
 	if !extractCfg.Enabled {
-		logger.Warnf(ctx, "extract config not enabled")
-		graphOut["skipped"] = "extract_disabled"
-		return nil
+		logger.Warnf(ctx, "extract config not enabled for chunk %s", chunkID)
+		out["skipped"] = "extract_disabled"
+		return out, nil
 	}
 
 	chatModel, err := s.modelService.GetChatModel(ctx, p.ModelID)
 	if err != nil {
-		logger.Errorf(ctx, "failed to get chat model: %v", err)
-		handleErr = err
-		return err
+		logger.Errorf(ctx, "failed to get chat model %s: %v", p.ModelID, err)
+		return out, err
 	}
 
 	template := &types.PromptTemplateStructured{
@@ -330,17 +491,68 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		},
 	}
 	extractor := chatpipeline.NewExtractor(chatModel, template)
-	graph, err := extractor.Extract(ctx, chunk.Content)
-	if err != nil {
-		handleErr = err
-		return err
+
+	// Guard against empty / whitespace-only chunks (OCR-only pages, image
+	// chunks, or documents whose text was stripped during preprocessing).
+	// Without this guard the LLM receives an empty prompt and returns
+	// empty/prose, which fails GraphData parsing and surfaces as
+	// GRAPH_EXTRACT_FAILED for an otherwise-valid document.
+	if strings.TrimSpace(chunk.Content) == "" {
+		logger.Infof(ctx, "graph extract: chunk %s has no text content, skipping", chunkID)
+		out["skipped"] = "empty_content"
+		return out, nil
 	}
 
-	chunk, err = s.chunkRepo.GetChunkByID(ctx, p.TenantID, p.ChunkID)
+	// Retry the LLM extraction on transient provider errors (5xx/504/timeout)
+	// with a short exponential backoff. Asynq already retries the whole task
+	// on terminal failure, but fast local retries absorb transient gateway
+	// blips without burning a full asynq retry cycle (and its longer delay).
+	const extractMaxAttempts = 3
+	var graph *types.GraphData
+	for attempt := 1; attempt <= extractMaxAttempts; attempt++ {
+		graph, err = extractor.Extract(ctx, chunk.Content)
+		if err == nil {
+			break
+		}
+		if !isTransientLLMError(ctx, err) {
+			break
+		}
+		if attempt == extractMaxAttempts {
+			break
+		}
+		backoff := 2 * time.Second << (attempt - 1)
+		logger.Warnf(ctx, "graph extract: LLM call failed for chunk %s (attempt %d/%d), retrying in %s: %v",
+			chunkID, attempt, extractMaxAttempts, backoff, err)
+		select {
+		case <-ctx.Done():
+			return out, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
 	if err != nil {
-		logger.Warnf(ctx, "graph ignore chunk %s: %v", p.ChunkID, err)
-		graphOut["skipped"] = "chunk_disappeared"
-		return nil
+		// Deterministic bad output: the LLM answered but its output could
+		// not be parsed into GraphData even after repairJSON + salvage.
+		// Retrying the same prompt against the same model overwhelmingly
+		// reproduces the same malformed output (observed live: ~750 batch
+		// failures from bad JSON, each retried 3 full times for nothing).
+		// Degrade to an empty graph for THIS chunk and keep the batch
+		// healthy; mark the checkpoint so a retry triggered by a sibling
+		// chunk's failure does not re-burn this chunk's LLM call either.
+		if errors.Is(err, chatpipeline.ErrGraphParseFailed) {
+			logger.Warnf(ctx, "graph extract: unparseable LLM output for chunk %s, degrading to empty graph: %v",
+				chunkID, err)
+			out["degraded"] = "parse_failed"
+			s.markGraphExtracted(ctx, p.TenantID, chunk)
+			return out, nil
+		}
+		return out, err
+	}
+
+	chunk, err = s.chunkRepo.GetChunkByID(ctx, p.TenantID, chunkID)
+	if err != nil {
+		logger.Warnf(ctx, "graph ignore chunk %s: %v", chunkID, err)
+		out["skipped"] = "chunk_disappeared"
+		return out, nil
 	}
 
 	for _, node := range graph.Node {
@@ -350,12 +562,15 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		types.NameSpace{KnowledgeBase: chunk.KnowledgeBaseID, Knowledge: chunk.KnowledgeID},
 		[]*types.GraphData{graph},
 	); err != nil {
-		logger.Errorf(ctx, "failed to add graph: %v", err)
-		handleErr = err
-		return err
+		logger.Errorf(ctx, "failed to add graph for chunk %s: %v", chunkID, err)
+		return out, err
 	}
-	graphOut["nodes_added"] = len(graph.Node)
-	graphOut["relations_added"] = len(graph.Relation)
+	// Checkpoint AFTER the graph store write succeeded: a batch retry (any
+	// sibling chunk failed, or the task was killed mid-batch) skips this
+	// chunk instead of re-running its LLM call and re-writing its graph.
+	s.markGraphExtracted(ctx, p.TenantID, chunk)
+	out["nodes_added"] = len(graph.Node)
+	out["relations_added"] = len(graph.Relation)
 	// Capture a couple of sample nodes/relations so the trace viewer can
 	// answer "what did the LLM actually extract?" without round-tripping
 	// to the graph store. Cap to two each — anything more bloats span
@@ -369,20 +584,20 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		for _, n := range samples {
 			names = append(names, n.Name)
 		}
-		graphOut["sample_nodes"] = names
+		out["sample_nodes"] = names
 	}
 	if len(graph.Relation) > 0 {
 		samples := graph.Relation
 		if len(samples) > 2 {
 			samples = samples[:2]
 		}
-		out := make([]string, 0, len(samples))
+		relOut := make([]string, 0, len(samples))
 		for _, r := range samples {
-			out = append(out, fmt.Sprintf("%s --[%s]--> %s", r.Node1, r.Type, r.Node2))
+			relOut = append(relOut, fmt.Sprintf("%s --[%s]--> %s", r.Node1, r.Type, r.Node2))
 		}
-		graphOut["sample_relations"] = out
+		out["sample_relations"] = relOut
 	}
-	return nil
+	return out, nil
 }
 
 // DataTableExtractPayload represents the table extract task payload

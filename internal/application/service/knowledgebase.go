@@ -44,6 +44,15 @@ type knowledgeBaseService struct {
 	syncLogRepo     interfaces.SyncLogRepository
 	dsScheduler     *datasource.Scheduler
 	audit           interfaces.AuditLogService
+	taskInspector   interfaces.TaskInspector
+
+	// Wiki cleanup dependencies (repositories, NOT services — depending on
+	// WikiPageService would create a DI cycle: WikiPageService needs
+	// KnowledgeBaseService, which is this very service). Wired in so
+	// ProcessKBDelete can wipe a KB's wiki index, index categories (folder
+	// tree) and change-log when the whole KB is deleted.
+	wikiRepo         interfaces.WikiPageRepository
+	wikiLogEntryRepo interfaces.WikiLogEntryRepository
 }
 
 // NewKnowledgeBaseService creates a new knowledge base service
@@ -64,6 +73,9 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 	syncLogRepo interfaces.SyncLogRepository,
 	dsScheduler *datasource.Scheduler,
 	audit interfaces.AuditLogService,
+	taskInspector interfaces.TaskInspector,
+	wikiRepo interfaces.WikiPageRepository,
+	wikiLogEntryRepo interfaces.WikiLogEntryRepository,
 ) interfaces.KnowledgeBaseService {
 	return &knowledgeBaseService{
 		repo:            repo,
@@ -83,6 +95,9 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 		syncLogRepo:     syncLogRepo,
 		dsScheduler:     dsScheduler,
 		audit:           audit,
+		taskInspector:   taskInspector,
+		wikiRepo:         wikiRepo,
+		wikiLogEntryRepo: wikiLogEntryRepo,
 	}
 }
 
@@ -704,6 +719,24 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 		vectorStoreIDSnapshot = kb.VectorStoreID
 	}
 
+	// Step 0: Cancel all queued / in-flight pipeline tasks for this KB so
+	// the Wiki queue, graph build, question/summary generation stop instead
+	// of running against rows that no longer exist. Done before the soft
+	// delete below so the knowledge list query still returns rows. Best-effort.
+	if s.taskInspector != nil {
+		if kbKnowledgeList, listErr := s.kgRepo.ListKnowledgeByKnowledgeBaseID(ctx, tenantID, id); listErr != nil {
+			logger.Warnf(ctx, "Failed to list knowledge for KB %s before cancel: %v", id, listErr)
+		} else {
+			kbKnowledgeIDs := make([]string, 0, len(kbKnowledgeList))
+			for _, k := range kbKnowledgeList {
+				kbKnowledgeIDs = append(kbKnowledgeIDs, k.ID)
+			}
+			if _, _, cerr := s.taskInspector.CancelTasksByKnowledgeBase(ctx, id, kbKnowledgeIDs); cerr != nil {
+				logger.Warnf(ctx, "Failed to cancel tasks for KB %s: %v", id, cerr)
+			}
+		}
+	}
+
 	// Step 1: Delete the knowledge base record first (mark as deleted)
 	logger.Infof(ctx, "Deleting knowledge base from database")
 	err = s.repo.DeleteKnowledgeBase(ctx, id)
@@ -794,6 +827,16 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 		knowledgeIDs := make([]string, 0, len(knowledgeList))
 		for _, knowledge := range knowledgeList {
 			knowledgeIDs = append(knowledgeIDs, knowledge.ID)
+		}
+
+		// Stop all queued / in-flight pipeline tasks for this KB before
+		// tearing down its data. Without this, graph-extract / wiki /
+		// question / summary tasks enqueued against the (soon-to-be-deleted)
+		// knowledge rows keep running and rebuild the graph after we clear it.
+		if s.taskInspector != nil {
+			if _, _, cerr := s.taskInspector.CancelTasksByKnowledgeBase(ctx, kbID, knowledgeIDs); cerr != nil {
+				logger.Warnf(ctx, "Failed to cancel tasks for KB %s: %v", kbID, cerr)
+			}
 		}
 
 		logger.Infof(ctx, "Deleting all knowledge entries and their resources")
@@ -897,6 +940,10 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 		}
 
+		// Wipe the KB's wiki index, index categories (folder tree) and
+		// change-log so a deleted KB leaves no residual wiki state.
+		s.cleanupKnowledgeBaseWiki(ctx, kbID)
+
 		// Delete all knowledge entries from database
 		logger.Infof(ctx, "Deleting knowledge entries from database")
 		if err := s.kgRepo.DeleteKnowledgeList(ctx, tenantID, knowledgeIDs); err != nil {
@@ -909,6 +956,53 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	logger.Infof(ctx, "KB delete task completed successfully, knowledge base ID: %s", kbID)
 	return nil
+}
+
+// cleanupKnowledgeBaseWiki wipes EVERY wiki-derived artifact for a KB being
+// deleted: all wiki pages (including the index + log system pages), the
+// folder / category tree, and the change-log entries. Mirrors the
+// knowledgeService.cleanupKnowledgeBaseWiki used when a KB is emptied; kept
+// separate only because the two services hold their wiki deps independently
+// (this one uses repositories to avoid a DI cycle with WikiPageService).
+// Best-effort and idempotent. Pages are removed before folders so the
+// DeleteFolder guard (no pages may reference the folder) passes for every
+// folder in the tree.
+func (s *knowledgeBaseService) cleanupKnowledgeBaseWiki(ctx context.Context, kbID string) {
+	if kbID == "" {
+		return
+	}
+	if s.wikiRepo != nil {
+		slugs, err := s.wikiRepo.ListAllSlugs(ctx, kbID)
+		if err != nil {
+			logger.Warnf(ctx, "KB delete: list wiki slugs for %s failed: %v", kbID, err)
+		} else {
+			for _, slug := range slugs {
+				if err := s.wikiRepo.Delete(ctx, kbID, slug); err != nil {
+					logger.Warnf(ctx, "KB delete: delete wiki page %s for %s failed: %v", slug, kbID, err)
+				}
+			}
+			logger.Infof(ctx, "KB delete: deleted %d wiki pages for %s", len(slugs), kbID)
+		}
+		folders, err := s.wikiRepo.ListAllFolders(ctx, kbID)
+		if err != nil {
+			logger.Warnf(ctx, "KB delete: list wiki folders for %s failed: %v", kbID, err)
+		} else {
+			for _, f := range folders {
+				if f == nil || f.ID == "" {
+					continue
+				}
+				if err := s.wikiRepo.DeleteFolder(ctx, kbID, f.ID); err != nil {
+					logger.Warnf(ctx, "KB delete: delete wiki folder %s for %s failed: %v", f.ID, kbID, err)
+				}
+			}
+			logger.Infof(ctx, "KB delete: deleted %d wiki folders for %s", len(folders), kbID)
+		}
+	}
+	if s.wikiLogEntryRepo != nil {
+		if err := s.wikiLogEntryRepo.DeleteByKB(ctx, kbID); err != nil {
+			logger.Warnf(ctx, "KB delete: delete wiki log entries for %s failed: %v", kbID, err)
+		}
+	}
 }
 
 // deleteDataSourcesForKnowledgeBase mirrors DataSourceService.DeleteDataSource for

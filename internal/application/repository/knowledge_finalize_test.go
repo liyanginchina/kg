@@ -318,3 +318,79 @@ func TestUpdateActiveDeletingKnowledgeColumns_GuardsStateAndSoftDelete(t *testin
 	status, _ = reloadKnowledgeRow(t, db, deletedDeletingID)
 	assert.Equal(t, types.ParseStatusDeleting, status)
 }
+
+// TestFinalizeSubtask_GraphBatchCountPromotesExactlyOnce mirrors the
+// knowledge_post_process.go graph batching: a knowledge with N text chunks
+// fans out graphBatchCount = ceil(N/5) batch tasks, each releasing exactly
+// one pending_subtasks_count slot on terminal exit. The seeded counter must
+// therefore start at graphBatchCount and reach zero after exactly that many
+// decrements, promoting to "completed" exactly once — never early, never
+// stuck. This is the batch-mode counterpart of
+// TestFinalizeSubtask_Concurrent_ExactlyOnePromote.
+func TestFinalizeSubtask_GraphBatchCountPromotesExactlyOnce(t *testing.T) {
+	const graphGenChunkBatchSize = 5
+	for _, chunkCount := range []int{1, 20, 21, 55, 100, 333} {
+		// Mirrors graphBatchCount in knowledge_post_process.go.
+		batchCount := (chunkCount + graphGenChunkBatchSize - 1) / graphGenChunkBatchSize
+
+		t.Run(itoa(chunkCount), func(t *testing.T) {
+			db := setupKnowledgeTestDB(t)
+			repo := NewKnowledgeRepository(db).(*knowledgeRepository)
+			ctx := context.Background()
+
+			id := insertProcessingKnowledge(t, db)
+			transitioned, err := repo.SetFinalizing(ctx, id, batchCount)
+			require.NoError(t, err)
+			require.True(t, transitioned, "SetFinalizing should transition processing -> finalizing")
+
+			var promoteWins atomic.Int32
+			var wg sync.WaitGroup
+			for i := 0; i < batchCount; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_, promoted, ferr := repo.FinalizeSubtask(ctx, id)
+					if ferr != nil {
+						t.Errorf("FinalizeSubtask: %v", ferr)
+						return
+					}
+					if promoted {
+						promoteWins.Add(1)
+					}
+				}()
+			}
+			wg.Wait()
+
+			assert.Equal(t, int32(1), promoteWins.Load(),
+				"exactly one caller must observe promoted=true for batchCount=%d", batchCount)
+
+			status, count := reloadKnowledgeRow(t, db, id)
+			assert.Equal(t, types.ParseStatusCompleted, status)
+			assert.Equal(t, 0, count)
+		})
+	}
+}
+
+// itoa is a tiny helper to name subtests without importing strconv in the
+// test file (keeps the import set minimal).
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}

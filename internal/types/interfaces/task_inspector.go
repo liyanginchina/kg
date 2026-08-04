@@ -28,6 +28,16 @@ type TaskInspector interface {
 	// truth, this just prevents wasted work.
 	CancelTasksForKnowledge(ctx context.Context, knowledgeID string) (deleted int, cancelled int, err error)
 
+	// CancelTasksByKnowledgeBase removes queued tasks that belong to a
+	// knowledge base: its KB-scoped triggers (wiki:ingest / wiki:finalize,
+	// matched on knowledge_base_id) and every knowledge-scoped task for the
+	// knowledge IDs that belonged to the KB. Used when a KB is deleted or
+	// emptied so its Wiki queue and graph/question/summary pipelines stop
+	// instead of running against rows that no longer exist.
+	// knowledgeIDs is the set of knowledge IDs that lived in the KB; the
+	// inspector matches on membership rather than doing a DB lookup.
+	CancelTasksByKnowledgeBase(ctx context.Context, kbID string, knowledgeIDs []string) (deleted int, cancelled int, err error)
+
 	// HasQueuedTasksForKnowledge reports whether any pending / scheduled
 	// / retry / active task referencing the given knowledge ID still
 	// lives in the queue backend. It is the read-only counterpart of

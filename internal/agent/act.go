@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -331,6 +332,25 @@ func (e *AgentEngine) runToolCall(
 		}
 		logger.Warnf(ctx, "%s Repaired malformed JSON arguments", toolTag)
 		tc.Function.Arguments = repaired
+	}
+
+	// Some LLM / OpenAI-compatible endpoints occasionally wrap tool-call
+	// arguments in an extra {"arguments": "<json string>"} object. That shape
+	// is still *valid* JSON, so the repair branch above never fires, and the
+	// inner arguments (e.g. knowledge_id) become invisible to the tool —
+	// surfacing as spurious "missing id parameter" / "missing ids" errors.
+	// Unwrap it here so the real arguments always reach the tool.
+	if len(args) == 1 {
+		if inner, ok := args["arguments"]; ok {
+			if innerStr, ok := inner.(string); ok && strings.TrimSpace(innerStr) != "" {
+				tc.Function.Arguments = innerStr
+				// Re-parse into args so the UI hint / recorded args reflect
+				// the real parameters rather than the wrapper object.
+				if innerErr := json.Unmarshal([]byte(innerStr), &args); innerErr != nil {
+					logger.Warnf(ctx, "%s Failed to parse unwrapped arguments: %v", toolTag, innerErr)
+				}
+			}
+		}
 	}
 
 	logger.Debugf(ctx, "%s Args: %s", toolTag, tc.Function.Arguments)

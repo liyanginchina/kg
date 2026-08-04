@@ -642,6 +642,7 @@ export default {
     statusProcessing: "처리 중",
     statusFinalizing: "최적화 중",
     statusPending: "대기 중",
+    statusQueued: "파싱 대기 중...",
     statusFailed: "실패",
     statusCancelled: "취소됨",
     statusDraft: "초안",
@@ -4374,6 +4375,10 @@ export default {
         instructionsLabel: "질문 생성 지침",
         instructionsDescription: "안정적인 출력 형식을 유지하면서 대상, 상황 및 표현 방식을 지정합니다",
         instructionsPlaceholder: "예: 시험 문제 형식을 피하고 자연스러운 고객 지원 질문을 생성…",
+      },
+      maxConcurrentParse: {
+        label: "동시 처리 파일 수",
+        description: "일괄 업로드 시 동시에 구문 분석되는 파일 수 상한(1-50, 기본 5), 초과 파일은 자동 대기",
       },
       tableMetadataInstructions: {
         label: "테이블 메타데이터 지침",

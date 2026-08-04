@@ -117,6 +117,28 @@ func (t *ListKnowledgeChunksTool) Execute(ctx context.Context, args json.RawMess
 		}, fmt.Errorf("missing id parameter")
 	}
 
+	// DecodeToolCalls resolves dN aliases registered in the request registry.
+	// When an alias is missing (document beyond RecentDocs / carried over from a
+	// prior agent turn) fall back to a positional resolve across the bound KBs.
+	resolvedID, resolveErr := resolveDocumentAlias(ctx, knowledgeID, t.knowledgeService, t.searchTargets)
+	if resolveErr != nil {
+		return &types.ToolResult{
+			Success: false,
+			Error:   fmt.Sprintf("failed to resolve document id %q: %v", knowledgeID, resolveErr),
+		}, resolveErr
+	}
+	if resolvedID == "" && IsDocumentAlias(knowledgeID) {
+		return &types.ToolResult{
+			Success: false,
+			Error: fmt.Sprintf(
+				"document %s is out of range: the bound knowledge base(s) have fewer documents than that index. "+
+					"Re-run knowledge_search or grep_chunks to obtain a current dN handle.",
+				knowledgeID,
+			),
+		}, fmt.Errorf("document alias out of range")
+	}
+	knowledgeID = resolvedID
+
 	// Get knowledge info without tenant filter to support shared KB
 	knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, knowledgeID)
 	if err != nil {

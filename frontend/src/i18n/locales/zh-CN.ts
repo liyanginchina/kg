@@ -84,12 +84,12 @@ export default {
     reopen: "新手引导",
     steps: {
       welcome: {
-        title: "欢迎使用 WeKnora",
+        title: "欢迎使用 KGBuddy",
         desc: "只需几步，带你快速了解知识库、对话与智能体的核心用法。点击「下一步」开始。",
       },
       knowledge: {
         title: "创建你的知识库",
-        desc: "知识库是一切的起点：上传文档、网页或 FAQ，WeKnora 会自动解析并建立索引。点击这里进入知识库。",
+        desc: "知识库是一切的起点：上传文档、网页或 FAQ，KGBuddy 会自动解析并建立索引。点击这里进入知识库。",
       },
       chat: {
         title: "发起智能对话",
@@ -640,6 +640,7 @@ export default {
     statusProcessing: "解析中",
     statusFinalizing: "优化中",
     statusPending: "等待中",
+    statusQueued: "排队等待解析...",
     statusFailed: "失败",
     statusCancelled: "已取消",
     statusDraft: "草稿",
@@ -1646,7 +1647,7 @@ export default {
   },
   initialization: {
     title: "初始化",
-    welcome: "欢迎使用WeKnora",
+    welcome: "欢迎使用KGBuddy",
     description: "请先配置系统以开始使用",
     step1: "步骤1：配置LLM模型",
     step2: "步骤2：配置嵌入模型",
@@ -1898,11 +1899,11 @@ export default {
     backToLogin: "返回登录",
     registerNow: "立即注册",
     loginHint: "登录以继续使用；首次使用请在下方创建账户。",
-    firstTime: "首次使用 WeKnora？",
+    firstTime: "首次使用 KGBuddy？",
     registerSuccess: "注册成功，请登录",
     registerFailed: "注册失败",
     subtitle: "RAG 问答、ReAct 智能体与 Wiki 知识库，大模型驱动的企业级知识框架",
-    registerSubtitle: "创建账户并开始使用 WeKnora",
+    registerSubtitle: "创建账户并开始使用 KGBuddy",
     emailPlaceholder: "输入邮箱地址",
     passwordPlaceholder: "输入密码（8-32个字符，包含字母和数字）",
     confirmPasswordPlaceholder: "再次输入密码",
@@ -3589,7 +3590,7 @@ export default {
     },
   },
   createChat: {
-    title: "Hi，我是 WeKnora，让你的知识触手可及",
+    title: "Hi，我是 KGBuddy，让你的知识触手可及",
     newSessionTitle: "新会话",
     messages: {
       selectKnowledgeBase: "请先选择知识库",
@@ -4420,6 +4421,10 @@ export default {
         instructionsLabel: "问题生成要求",
         instructionsDescription: "指定问题面向的人群、场景和表达方式，系统仍维护稳定输出格式",
         instructionsPlaceholder: "例如：生成客服用户常问的自然语言问题，避免考试题式表达…",
+      },
+      maxConcurrentParse: {
+        label: "同时处理文件数",
+        description: "批量上传时同时解析的文件数量上限（1-50，默认 5），超出的文件自动排队等待",
       },
       tableMetadataInstructions: {
         label: "表格元数据生成要求",
@@ -6635,7 +6640,7 @@ export default {
     chrome: {
       title: "知识管理助手",
       subtitle:
-        "配合 WeKnora 自建服务使用：在任意网页侧边栏提问、剪藏内容、Markdown 速记，将浏览中的知识沉淀到你的知识库。",
+        "配合 KGBuddy 自建服务使用：在任意网页侧边栏提问、剪藏内容、Markdown 速记，将浏览中的知识沉淀到你的知识库。",
       capabilitiesTitle: "核心能力",
       capabilities: {
         qa: {
@@ -6670,7 +6675,7 @@ export default {
         },
         port: {
           title: "桌面版配置固定端口（推荐）",
-          desc: "使用 WeKnora 桌面版时，在 API 信息中设置固定端口（如 37841），避免每次启动后地址变化导致插件断连。",
+          desc: "使用 KGBuddy 桌面版时，在 API 信息中设置固定端口（如 37841），避免每次启动后地址变化导致插件断连。",
         },
         install: {
           title: "安装 Chrome 插件",
@@ -6689,7 +6694,7 @@ export default {
       storeMeta: "Chrome 应用商店 · v1.0.0",
     },
     claw: {
-      title: "WeKnora Skill",
+      title: "KGBuddy Skill",
       subtitle:
         "通过 WeKnora REST API 导入文档并执行混合检索（向量 + 关键词）。适用于上传文件/URL/Markdown 到知识库、跨库检索与浏览知识内容。",
       capabilitiesTitle: "Skill 能力",

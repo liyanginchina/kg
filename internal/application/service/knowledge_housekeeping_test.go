@@ -111,6 +111,12 @@ func (f fakeTaskInspector) CancelTasksForKnowledge(
 	return 0, 0, nil
 }
 
+func (f fakeTaskInspector) CancelTasksByKnowledgeBase(
+	_ context.Context, _ string, _ []string,
+) (int, int, error) {
+	return 0, 0, nil
+}
+
 func (f fakeTaskInspector) HasQueuedTasksForKnowledge(
 	_ context.Context, knowledgeID string,
 ) (bool, error) {

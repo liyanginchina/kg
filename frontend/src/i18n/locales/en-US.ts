@@ -639,6 +639,7 @@ export default {
     statusProcessing: 'Processing',
     statusFinalizing: 'Optimizing',
     statusPending: 'Pending',
+    statusQueued: 'Queued for parsing...',
     statusFailed: 'Failed',
     statusCancelled: 'Cancelled',
     statusDraft: 'Draft',
@@ -3135,6 +3136,10 @@ export default {
         instructionsLabel: 'Question Generation Instructions',
         instructionsDescription: 'Specify audience, scenario, and wording while the system retains the stable output format',
         instructionsPlaceholder: 'For example: generate natural customer-support questions and avoid exam-style wording…',
+      },
+      maxConcurrentParse: {
+        label: 'Concurrent File Processing',
+        description: 'Maximum number of files parsed simultaneously during batch upload (1-50, default 5); extra files queue automatically',
       },
       tableMetadataInstructions: {
         label: 'Table Metadata Instructions',

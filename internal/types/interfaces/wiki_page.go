@@ -345,6 +345,15 @@ type WikiPageRepository interface {
 	// ListAll retrieves all wiki pages in a knowledge base (for link rebuilding, graph generation).
 	ListAll(ctx context.Context, kbID string) ([]*types.WikiPage, error)
 
+	// ListAllGraph is a graph-optimized projection of ListAll. It returns the
+	// same slice of pages but only the columns the knowledge-graph endpoints
+	// actually consume — slug, title, page_type, status, in_links, out_links —
+	// deliberately omitting the heavy `content` TEXT column. This turns the
+	// graph endpoints from a full-row (multi-MB content) scan into a narrow
+	// index/link scan, which is the dominant cost on KBs with tens of
+	// thousands of wiki pages.
+	ListAllGraph(ctx context.Context, kbID string) ([]*types.WikiPage, error)
+
 	// ListRecentForSuggestions returns recent user-visible wiki pages under the given
 	// knowledge bases, used to produce fallback suggested questions for Wiki-only KBs
 	// that do not have AI-generated document questions or recommended FAQ entries.

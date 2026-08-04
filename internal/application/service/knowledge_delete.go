@@ -81,8 +81,14 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 	// here avoids waking workers just to no-op when the parse was still
 	// in flight at delete time. No-op in Lite mode and on completed rows
 	// (no queued descendants anyway).
+	//
+	// Covers pending / processing / finalizing: a knowledge in
+	// "finalizing" already has graph-extract / question / summary tasks
+	// enqueued, and deleting it must cancel those too — otherwise the
+	// graph keeps building against rows we just removed.
 	if originalStatus == types.ParseStatusPending ||
-		originalStatus == types.ParseStatusProcessing {
+		originalStatus == types.ParseStatusProcessing ||
+		originalStatus == types.ParseStatusFinalizing {
 		s.dequeueKnowledgeTasks(ctx, id)
 	}
 
@@ -182,6 +188,15 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 	// row is gone is the tolerable failure mode instead.
 	if err := s.repo.DeleteKnowledge(ctx, tenantID, id); err != nil {
 		return err
+	}
+
+	// If this was the last document in the KB, wipe its wiki index, index
+	// categories (folder tree) and change-log so no stale wiki state
+	// survives the deletion. Skipped for non-wiki KBs (nothing to clean).
+	if kb != nil && kb.IsWikiEnabled() {
+		if remaining, cntErr := s.repo.CountKnowledgeByKnowledgeBaseID(ctx, tenantID, knowledge.KnowledgeBaseID); cntErr == nil && remaining == 0 {
+			s.cleanupKnowledgeBaseWiki(ctx, knowledge.KnowledgeBaseID)
+		}
 	}
 
 	// Best-effort physical cleanup. Errors here only leak storage; they must not
@@ -466,7 +481,8 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 				Errorf("DeleteKnowledgeList failed to mark as deleting")
 			// Continue with deletion even if marking fails
 		}
-		if prev == types.ParseStatusPending || prev == types.ParseStatusProcessing {
+		if prev == types.ParseStatusPending || prev == types.ParseStatusProcessing ||
+			prev == types.ParseStatusFinalizing {
 			inFlightIDs = append(inFlightIDs, knowledge.ID)
 		}
 	}
@@ -649,6 +665,38 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 		recordKBActivity(ctx, s.audit, tenantInfo.ID, kbID, types.AuditActionKnowledgeBatchDeleted,
 			"knowledge", "", types.AuditOutcomeSuccess, details)
 	}
+
+	// When a KB is left with zero knowledge rows after this delete, cancel
+	// its KB-scoped queued tasks (wiki:ingest / wiki:finalize triggers that
+	// carry only knowledge_base_id) so the Wiki queue pending count returns
+	// to zero instead of lingering forever. Per-knowledge tasks were already
+	// dequeued above via dequeueKnowledgeTasks.
+	for kbID := range byKB {
+		remaining, cntErr := s.repo.CountKnowledgeByKnowledgeBaseID(ctx, tenantInfo.ID, kbID)
+		if cntErr != nil {
+			logger.Warnf(ctx, "wiki cleanup: failed to count remaining knowledge for KB %s: %v", kbID, cntErr)
+			continue
+		}
+		if remaining == 0 {
+			kbKnowledgeIDs := make([]string, 0, len(byKB[kbID]))
+			for _, k := range byKB[kbID] {
+				kbKnowledgeIDs = append(kbKnowledgeIDs, k.ID)
+			}
+			if s.taskInspector != nil {
+				if _, _, cerr := s.taskInspector.CancelTasksByKnowledgeBase(ctx, kbID, kbKnowledgeIDs); cerr != nil {
+					logger.Warnf(ctx, "wiki cleanup: failed to cancel KB-scoped tasks for emptied KB %s: %v", kbID, cerr)
+				} else {
+					logger.Infof(ctx, "wiki cleanup: cancelled KB-scoped tasks for emptied KB %s (%d knowledge)", kbID, len(kbKnowledgeIDs))
+				}
+			}
+			// The KB is now empty: wipe its wiki index, index categories
+			// (folder tree) and change-log so no stale wiki state lingers.
+			// Ordered after the task cancel so no orphan retract rebuilds
+			// the index we are about to remove.
+			s.cleanupKnowledgeBaseWiki(ctx, kbID)
+		}
+	}
+
 	return nil
 }
 
@@ -737,6 +785,72 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 	}
 
 	return cleanupErr
+}
+
+// cleanupKnowledgeBaseWiki wipes EVERY wiki-derived artifact for a KB:
+//   - all wiki pages (summary / entity / concept / synthesis / comparison /
+//     AND the index + log pages that per-document cleanup deliberately
+//     leaves behind for the async retract handler to rebuild),
+//   - the folder / category tree (wiki_folders rows), and
+//   - the wiki change-log entries.
+//
+// It is called when a KB is emptied (all documents deleted) or deleted
+// wholesale, so the wiki index, index categories, and logs do not linger
+// after the source documents are gone. Best-effort and idempotent: any
+// "not found" is logged and ignored, and the KB-level graph is handled
+// separately by DelGraph (keyed on each document's knowledge id).
+//
+// ORDER MATTERS: pages must be removed BEFORE folders. repo.DeleteFolder
+// refuses to soft-delete a folder that still has pages pointing at it
+// (NOT EXISTS (SELECT 1 FROM wiki_pages WHERE folder_id = ?)), so deleting
+// every page first lets the folder sweep clear the whole tree.
+func (s *knowledgeService) cleanupKnowledgeBaseWiki(ctx context.Context, kbID string) {
+	if kbID == "" {
+		return
+	}
+
+	// 1. Delete every wiki page. Covers the index + log system pages that
+	//    per-document cleanup skips, and any per-document pages whose
+	//    source_refs were already stripped to empty by cleanup.
+	if s.wikiService != nil {
+		slugs, err := s.wikiService.ListAllSlugs(ctx, kbID)
+		if err != nil {
+			logger.Warnf(ctx, "wiki cleanup: list slugs for KB %s failed: %v", kbID, err)
+		} else {
+			for _, slug := range slugs {
+				if err := s.wikiService.DeletePage(ctx, kbID, slug); err != nil {
+					logger.Warnf(ctx, "wiki cleanup: delete page %s for KB %s failed: %v", slug, kbID, err)
+				}
+			}
+			logger.Infof(ctx, "wiki cleanup: deleted %d wiki pages for KB %s", len(slugs), kbID)
+		}
+	}
+
+	// 2. Delete the folder / category tree. Runs AFTER pages are gone so
+	//    the DeleteFolder guard passes for every folder.
+	if s.wikiRepo != nil {
+		folders, err := s.wikiRepo.ListAllFolders(ctx, kbID)
+		if err != nil {
+			logger.Warnf(ctx, "wiki cleanup: list folders for KB %s failed: %v", kbID, err)
+		} else {
+			for _, f := range folders {
+				if f == nil || f.ID == "" {
+					continue
+				}
+				if err := s.wikiRepo.DeleteFolder(ctx, kbID, f.ID); err != nil {
+					logger.Warnf(ctx, "wiki cleanup: delete folder %s for KB %s failed: %v", f.ID, kbID, err)
+				}
+			}
+			logger.Infof(ctx, "wiki cleanup: deleted %d wiki folders for KB %s", len(folders), kbID)
+		}
+	}
+
+	// 3. Delete the wiki change-log feed.
+	if s.wikiLogEntryService != nil {
+		if err := s.wikiLogEntryService.DeleteByKB(ctx, kbID); err != nil {
+			logger.Warnf(ctx, "wiki cleanup: delete log entries for KB %s failed: %v", kbID, err)
+		}
+	}
 }
 
 // ProcessKnowledgeListDelete handles Asynq knowledge list delete tasks

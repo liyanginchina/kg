@@ -280,6 +280,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Provide(router.NewMaintenanceAsynqServer, dig.Name("maintenanceAsynqServer")))
 		must(container.Provide(router.NewSharedAsynqServer, dig.Name("sharedAsynqServer")))
 		must(container.Provide(router.NewWikiAsynqServer, dig.Name("wikiAsynqServer")))
+		must(container.Provide(router.NewGraphAsynqServer, dig.Name("graphAsynqServer")))
 		// Asynq inspector for cancel-by-knowledge-id (best-effort
 		// dequeue of pending/scheduled/retry tasks + active-task cancel).
 		must(container.Provide(router.NewAsynqInspector))

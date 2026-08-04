@@ -167,14 +167,39 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 
 	for _, knowledgeID := range knowledgeIDs {
 		wg.Add(1)
-		go func(id string) {
+		go func(origID string) {
 			defer wg.Done()
 
+			origID = strings.TrimSpace(origID)
+			if origID == "" {
+				return
+			}
+
+			// DecodeToolCalls resolves dN aliases registered in the request
+			// registry; fall back to a positional resolve when an alias is
+			// missing (document beyond RecentDocs / carried from a prior turn).
+			lookupID, resolveErr := resolveDocumentAlias(ctx, origID, t.knowledgeService, t.searchTargets)
+			if resolveErr != nil {
+				mu.Lock()
+				results[origID] = &docInfo{err: fmt.Errorf("failed to resolve document id %q: %v", origID, resolveErr)}
+				mu.Unlock()
+				return
+			}
+			if lookupID == "" && IsDocumentAlias(origID) {
+				mu.Lock()
+				results[origID] = &docInfo{err: fmt.Errorf("document %s is out of range: the bound knowledge base(s) have fewer documents than that index", origID)}
+				mu.Unlock()
+				return
+			}
+			if lookupID == "" {
+				lookupID = origID
+			}
+
 			// Get knowledge metadata without tenant filter to support shared KB
-			knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, id)
+			knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, lookupID)
 			if err != nil {
 				mu.Lock()
-				results[id] = &docInfo{
+				results[origID] = &docInfo{
 					err: fmt.Errorf("failed to get document info: %v", err),
 				}
 				mu.Unlock()
@@ -184,7 +209,7 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 			// Verify the knowledge's KB is in searchTargets (permission check)
 			if !t.searchTargets.ContainsKB(knowledge.KnowledgeBaseID) {
 				mu.Lock()
-				results[id] = &docInfo{
+				results[origID] = &docInfo{
 					err: fmt.Errorf("knowledge base %s is not accessible", knowledge.KnowledgeBaseID),
 				}
 				mu.Unlock()
@@ -194,9 +219,9 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 			if scopeErr != nil || !allowed {
 				mu.Lock()
 				if scopeErr != nil {
-					results[id] = &docInfo{err: fmt.Errorf("failed to validate document scope: %v", scopeErr)}
+					results[origID] = &docInfo{err: fmt.Errorf("failed to validate document scope: %v", scopeErr)}
 				} else {
-					results[id] = &docInfo{err: fmt.Errorf("document %s is not within the current @mention scope", knowledge.ID)}
+					results[origID] = &docInfo{err: fmt.Errorf("document %s is not within the current @mention scope", knowledge.ID)}
 				}
 				mu.Unlock()
 				return
@@ -206,13 +231,13 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 			// Keep chunk-type filter aligned with list_knowledge_chunks so the
 			// "chunk_count" reported here matches what that tool can page over.
 			_, total, err := t.chunkService.GetRepository().
-				ListPagedChunksByKnowledgeID(ctx, knowledge.TenantID, id, &types.Pagination{
+				ListPagedChunksByKnowledgeID(ctx, knowledge.TenantID, lookupID, &types.Pagination{
 					Page:     1,
 					PageSize: 1,
 				}, []types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ}, nil, "", "", "", "")
 			if err != nil {
 				mu.Lock()
-				results[id] = &docInfo{
+				results[origID] = &docInfo{
 					err: fmt.Errorf("failed to get document info: %v", err),
 				}
 				mu.Unlock()
@@ -221,7 +246,7 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 			chunkCount := int(total)
 
 			mu.Lock()
-			results[id] = &docInfo{
+			results[origID] = &docInfo{
 				knowledge:  knowledge,
 				chunkCount: chunkCount,
 			}

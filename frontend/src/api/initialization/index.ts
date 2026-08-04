@@ -137,6 +137,9 @@ export interface KBModelConfigRequest {
         // Language hints for heuristic patterns. Empty array = auto-detect.
         languages?: string[]
         tableMetadataInstructions?: string
+        // Per-KB cap on concurrently parsed documents (batch upload throttle).
+        // 0 = server default (5).
+        maxConcurrentParse?: number
     }
     multimodal: {
         enabled: boolean

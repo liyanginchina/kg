@@ -14,6 +14,7 @@ func TestQueueDefinitionsAreUniqueAndConsumable(t *testing.T) {
 		WorkerPoolEnrichment:  true,
 		WorkerPoolMaintenance: true,
 		WorkerPoolWiki:        true,
+		WorkerPoolGraph:       true,
 	}
 	seen := make(map[string]bool, len(definitions))
 	seenTaskTypes := make(map[string]string)

@@ -10,6 +10,7 @@ const (
 	WorkerPoolMaintenance = "maintenance"
 	WorkerPoolShared      = "shared"
 	WorkerPoolWiki        = "wiki"
+	WorkerPoolGraph       = "graph"
 
 	// Upstream defaults are explicit guarantees plus an elastic pool. The
 	// shared pool may consume core and enrichment queues, so idle capacity in
@@ -20,7 +21,19 @@ const (
 	DefaultMaintenanceWorkerConcurrency = 4
 	DefaultSharedWorkerConcurrency      = 6
 	DefaultWikiWorkerConcurrency        = 8
-	DefaultUpstreamWorkerConcurrency    = DefaultCoreWorkerConcurrency +
+	// Graph extraction is a high-fanout task. Giving it a dedicated pool
+	// (instead of sharing the enrichment pool with summary/multimodal/
+	// question) prevents a bulk import's summary/multimodal burst from
+	// starving graph extraction — the dominant cause of graph build falling
+	// behind. Each task now batches graphGenChunkBatchSize chunks
+	// (knowledge_post_process.go) but still fans out the same total number
+	// of I/O-bound LLM calls, so worker-pool concurrency must stay high.
+	// The previous default of 8 was a regression from the 12-concurrency
+	// shared enrichment pool it replaced; 32 restores throughput and clears
+	// the backlog promptly. See DefaultGraphWorkerConcurrency override via
+	// WEKNORA_ASYNQ_GRAPH_CONCURRENCY.
+	DefaultGraphWorkerConcurrency    = 32
+	DefaultUpstreamWorkerConcurrency = DefaultCoreWorkerConcurrency +
 		DefaultPostProcessWorkerConcurrency + DefaultEnrichmentWorkerConcurrency +
 		DefaultMaintenanceWorkerConcurrency + DefaultSharedWorkerConcurrency
 )
@@ -72,7 +85,7 @@ var queueDefinitions = []QueueDefinition{
 		TypeSummaryGeneration, TypeDataTableSummary,
 	}},
 	{Name: QueueMultimodal, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeImageMultimodal}},
-	{Name: QueueGraph, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeChunkExtract}},
+	{Name: QueueGraph, Pool: WorkerPoolGraph, Weight: 1, TaskTypes: []string{TypeChunkExtract}},
 	{Name: QueueQuestion, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeQuestionGeneration}},
 	{Name: QueueSync, Pool: WorkerPoolMaintenance, Weight: 2, TaskTypes: []string{TypeDataSourceSync}},
 	{Name: QueueMaintenance, Pool: WorkerPoolMaintenance, Weight: 1, TaskTypes: []string{
@@ -141,6 +154,7 @@ type WorkerPoolConcurrency struct {
 	Maintenance int
 	Shared      int
 	Wiki        int
+	Graph       int
 }
 
 func DefaultWorkerPoolConcurrency() WorkerPoolConcurrency {
@@ -151,6 +165,7 @@ func DefaultWorkerPoolConcurrency() WorkerPoolConcurrency {
 		Maintenance: DefaultMaintenanceWorkerConcurrency,
 		Shared:      DefaultSharedWorkerConcurrency,
 		Wiki:        DefaultWikiWorkerConcurrency,
+		Graph:       DefaultGraphWorkerConcurrency,
 	}
 }
 
@@ -176,6 +191,7 @@ func ResolveWorkerPoolConcurrency(read func(key, env string, fallback int) int) 
 	allocation.Maintenance = positive("asynq.maintenance_concurrency", "WEKNORA_ASYNQ_MAINTENANCE_CONCURRENCY", allocation.Maintenance)
 	allocation.Shared = positive("asynq.shared_concurrency", "WEKNORA_ASYNQ_SHARED_CONCURRENCY", allocation.Shared)
 	allocation.Wiki = positive("asynq.wiki_concurrency", "WEKNORA_WIKI_ASYNQ_CONCURRENCY", allocation.Wiki)
+	allocation.Graph = positive("asynq.graph_concurrency", "WEKNORA_ASYNQ_GRAPH_CONCURRENCY", allocation.Graph)
 	return allocation
 }
 
@@ -264,6 +280,21 @@ type ExtractChunkPayload struct {
 	// knowledge's text-chunk set, used as the subspan name suffix
 	// ("postprocess.graph.chunk[3]") so the timeline preserves order.
 	ChunkIndex int `json:"chunk_index,omitempty"`
+	// ChunkIDs switches the handler into batched fan-out mode: the task
+	// extracts graph data for this ordered window of text chunks instead of
+	// a single one. Batching (rather than one task per chunk) keeps the graph
+	// task count bounded for very large documents while preserving per-batch
+	// retry / cancellation granularity and letting the worker read fresh
+	// chunk content at run time. Following the QuestionGenerationPayload
+	// precedent, we carry only chunk ids (not their content) so the payload
+	// stays small. Empty means the legacy single-chunk mode (ChunkID set),
+	// retained so interim per-chunk tasks enqueued before batching shipped
+	// still run.
+	ChunkIDs []string `json:"chunk_ids,omitempty"`
+	// BatchIndex is the 0-based ordinal of this batch inside the parent
+	// knowledge's text-chunk set, used as the subspan name suffix
+	// ("postprocess.graph.batch[3]") so the timeline preserves order.
+	BatchIndex int `json:"batch_index,omitempty"`
 }
 
 // DocumentProcessPayload represents the document process task payload
@@ -290,6 +321,12 @@ type DocumentProcessPayload struct {
 	// retried spans overwrite the previous attempt's row rather than
 	// fan out into a new attempt for every retry.
 	Attempt int `json:"attempt,omitempty"`
+	// ParseDeferCount counts how many times this task has been re-scheduled
+	// because its KB was at the parse concurrency cap
+	// (ChunkingConfig.MaxConcurrentParse). Drives exponential backoff of the
+	// re-schedule delay so large batch uploads don't hammer Redis/logs with
+	// fixed 10-20s retries for hours.
+	ParseDeferCount int `json:"parse_defer_count,omitempty"`
 }
 
 // FAQImportPayload represents the FAQ import task payload (including dry run mode)
