@@ -270,6 +270,38 @@ make dev-frontend
 **详细文档：** [开发环境快速入门](./docs/开发指南.md)
 
 
+## 🛠 本地优化与调整记录（Local Optimizations & Adjustments）
+
+> 以下变更为本地工作副本的优化调整，已包含在提交 `12d219ef`（`feat(knowledge): optimize graph batch extraction and add resilience`，57 文件，+3040/-278），并同步至个人 fork。
+
+### 1. 图谱批量抽取优化（graph batch extraction）
+- **批大小 20 → 5**：`graphGenChunkBatchSize` 由 20 降至 5（`internal/application/service/knowledge_post_process.go:508`），对齐 question 批的调优经验，降低单批内串行 LLM 调用时长，缓解逼近 30min asynq 超时的问题。
+- **断点续传**：新增 chunk 标志位 `ChunkFlagGraphExtracted`（`internal/types/chunk.go:69`，`1<<3`）。`extract.go` 抽取前检查该标志跳过已完成 chunk，成功后 `markGraphExtracted` 打点；单个 chunk 失败改为 `continue` 收集而非整批 `return`，已成功的 chunk 不再因同批其他 chunk 失败而重做。
+- **容错降级**：新增 `ErrGraphParseFailed` sentinel（`internal/application/service/chat_pipeline/extract_entity.go`），LLM 输出坏 JSON 时降级为该 chunk 空图（空节点/关系）而非整批失败，避免重试风暴。
+
+### 2. per-KB 解析并发限流
+- 新增 `internal/application/service/knowledge_parse_slots.go`：基于 `ChunkingConfig.MaxConcurrentParse`（默认 `DefaultKBMaxConcurrentParse = 5`，`internal/types/knowledgebase.go:216`）的 per-KB 信号量 `kbParseSlots`。
+- `ProcessDocument`（`knowledge_process.go`）入口 `tryAcquire`，超限时通过 `asynq.ProcessIn` 带抖动延迟重入队（不阻塞 worker），避免单 KB 大批量文档解析挤占全局 worker 池。
+
+### 3. Wiki 引用批预算优化
+- `maxRunesPerCitationBatch` 由 12000 提升至 **24000**（`internal/application/service/wiki_ingest_cite.go:28`），单批可容纳更大引用上下文、减少批次数；对应单测 `wiki_ingest_cite_test.go` 已同步更新（小 chunk 5k→10k、超大 chunk 20k→40k）。
+
+### 4. 删除清理增强（deletion cleanup）
+- **删除门控补齐 `finalizing`**：`DeleteKnowledge` / `DeleteKnowledgeList` 在 `pending`/`processing` 基础上加入 `finalizing`，取消已入队的图谱/摘要/问题任务。
+- **KB 级任务取消**：`internal/router/task_inspector.go` 新增 `CancelTasksByKnowledgeBase(kbID, knowledgeIDs)`，按 `knowledge_base_id` 匹配并取消 KB 级 wiki 触发器（`wiki:ingest`/`wiki:finalize`），避免删除 KB 后 Wiki 队列残留孤儿任务。
+- **Wiki 数据同步清理**：新增 `knowledgeService.cleanupKnowledgeBaseWiki(kbID)`，按序删除全部 wiki 页面（含 index/log）→ 文件夹树 → 日志条目；顺序关键（须先删页面再删文件夹，否则 `wiki_folders` 守卫拦截）。
+- **DI 约束**：`knowledgeBaseService` 操作 wiki 必须注入 repository（`WikiPageRepository` / `WikiLogEntryRepository`），不得依赖 `WikiPageService`（会形成 fx 循环依赖，容器启动 panic）。
+
+### 5. 前端与品牌调整
+- Logo 更换为 `frontend/src/assets/img/kgbuddy.png`；修复 `frontend/src/components/menu.vue` 资源路径笔误 `imwg` → `img`（此前会导致 logo 404）。
+- 多语言文案同步更新（`zh-CN` / `en-US` / `ko-KR` / `ru-RU`）。
+- 品牌切换：配置模板 `config/prompt_templates/*.yaml` 由 WeKnora 改为 **KGBuddy**（by LiYang）。
+
+### 6. 部署与配置修复
+- 修复 `docker-compose.yml` 笔误：`WEKNORA_WIKI_ASYNQ_CONCURRENCITY`（缺 Y）→ `WEKNORA_WIKI_ASYNQ_CONCURRENCY`，使 wiki 并发 env 正确生效（此前静默失效）。
+- `.env` 新增 `WEKNORA_ASYNQ_GRAPH_CONCURRENCY=8`（graph 抽取独立池并发，默认值即 8）。
+- 新增分析文档：`docs/graph_extract_perf_analysis.md`、`docs/knowledge_stuck_finalizing_plan.md`。
+
 ## 🤝 贡献指南
 
 欢迎通过 [Issue](https://github.com/Tencent/WeKnora/issues) 反馈问题或提交 Pull Request。
