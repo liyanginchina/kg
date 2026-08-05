@@ -144,9 +144,24 @@ func (s *DockerSandbox) buildDockerArgs(config *ExecuteConfig) []string {
 	args = append(args, "--pids-limit", "100")
 	args = append(args, "--security-opt", "no-new-privileges")
 
-	// Mount the script and working directory as read-only
+	// Mount the script directory as the workspace.
+	// - By default it is read-only (skills / read-only tooling).
+	// - When WritableDir is set (write_file / bash tools), mount the writable
+	//   directory (which is also where the script lives) read-write so the
+	//   container can persist files inside the session-scoped workspace.
 	scriptDir := filepath.Dir(config.Script)
-	args = append(args, "-v", fmt.Sprintf("%s:/workspace:ro", scriptDir))
+	mountSpec := fmt.Sprintf("%s:/workspace:ro", scriptDir)
+	if config.WritableDir != "" {
+		wd := config.WritableDir
+		// Prefer the script dir when it equals the writable dir to keep a single
+		// mount; otherwise mount writable dir at /workspace/writeable.
+		if filepath.Clean(wd) == filepath.Clean(scriptDir) {
+			mountSpec = fmt.Sprintf("%s:/workspace:rw", wd)
+		} else {
+			args = append(args, "-v", fmt.Sprintf("%s:/workspace/writeable:rw", wd))
+		}
+	}
+	args = append(args, "-v", mountSpec)
 
 	// Working directory
 	args = append(args, "-w", "/workspace")

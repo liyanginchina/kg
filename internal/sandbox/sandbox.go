@@ -83,6 +83,12 @@ type ExecuteConfig struct {
 	// WorkDir is the working directory for script execution
 	WorkDir string
 
+	// WritableDir is an optional host directory that is mounted read-write into
+	// the sandbox and used as the writable working area. When empty, the script
+	// directory is mounted read-only. Used by write_file / bash tools so they
+	// can persist files inside a session-scoped workspace.
+	WritableDir string
+
 	// Timeout is the maximum execution time (0 = use default)
 	Timeout time.Duration
 

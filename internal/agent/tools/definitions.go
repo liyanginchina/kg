@@ -18,6 +18,9 @@ const (
 	ToolDataSchema          = "data_schema"
 	ToolWebSearch           = "web_search"
 	ToolWebFetch            = "web_fetch"
+	// Shell / file-write tools (only available when explicitly enabled in allowed_tools)
+	ToolWriteFile = "write_file"
+	ToolBash      = "bash"
 	// Skills-related tools (only available when skills are enabled)
 	ToolExecuteSkillScript = "execute_skill_script"
 	ToolReadSkill          = "read_skill"
@@ -57,6 +60,8 @@ func AvailableToolDefinitions() []AvailableTool {
 		{Name: ToolDataSchema, Label: "查看数据元信息", Description: "获取表格文件的元信息"},
 		{Name: ToolReadSkill, Label: "读取技能", Description: "按需读取技能内容以学习专业能力"},
 		{Name: ToolExecuteSkillScript, Label: "执行技能脚本", Description: "在沙箱环境中执行技能脚本"},
+		{Name: ToolWriteFile, Label: "写文件", Description: "在沙箱隔离的会话工作目录中写入文件（仅限会话临时目录）"},
+		{Name: ToolBash, Label: "执行命令", Description: "在沙箱中执行 shell 命令（受限命令白名单，仅限会话临时目录）"},
 		{Name: ToolWikiReadPage, Label: "读取Wiki页面", Description: "读取指定的Wiki页面内容"},
 		{Name: ToolWikiSearch, Label: "搜索Wiki", Description: "在Wiki中搜索页面"},
 		{Name: ToolWikiReadSourceDoc, Label: "精读源文档", Description: "使用知识点深入阅读特定原始文档"},

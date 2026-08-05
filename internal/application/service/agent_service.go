@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 
 	"github.com/Tencent/WeKnora/internal/agent"
@@ -103,6 +105,56 @@ type agentService struct {
 	tenantService         interfaces.TenantService
 	storageResolver       interfaces.StorageBackendResolver
 	toolApprovalGate      approval.MCPApproval
+
+	// sandboxMgr caches the lazily-initialized sandbox manager shared by the
+	// skills manager and the shell tools (write_file / bash). It is built on
+	// first use so both registerTools and initializeSkillsManager reuse it.
+	sandboxMgr sandbox.Manager
+}
+
+// getSandboxManager lazily builds and caches the shared sandbox manager based
+// on WEKNORA_SANDBOX_MODE / WEKNORA_SANDBOX_TIMEOUT / WEKNORA_SANDBOX_DOCKER_IMAGE.
+func (s *agentService) getSandboxManager(ctx context.Context) sandbox.Manager {
+	if s.sandboxMgr != nil {
+		return s.sandboxMgr
+	}
+	sandboxMode := os.Getenv("WEKNORA_SANDBOX_MODE")
+	if sandboxMode == "" {
+		sandboxMode = "disabled"
+	}
+	dockerImage := os.Getenv("WEKNORA_SANDBOX_DOCKER_IMAGE")
+	if dockerImage == "" {
+		dockerImage = sandbox.DefaultDockerImage
+	}
+	sandboxTimeoutStr := os.Getenv("WEKNORA_SANDBOX_TIMEOUT")
+	sandboxTimeout := 60
+	if sandboxTimeoutStr != "" {
+		if v, err := strconv.Atoi(sandboxTimeoutStr); err == nil && v > 0 {
+			sandboxTimeout = v
+		}
+	}
+
+	var mgr sandbox.Manager
+	var err error
+	switch sandboxMode {
+	case "docker":
+		mgr, err = sandbox.NewManagerFromType("docker", true, dockerImage)
+		if err != nil {
+			logger.Warnf(ctx, "Failed to initialize Docker sandbox, falling back to disabled: %v", err)
+			mgr = sandbox.NewDisabledManager()
+		}
+	case "local":
+		mgr, err = sandbox.NewManagerFromType("local", false, "")
+		if err != nil {
+			logger.Warnf(ctx, "Failed to initialize local sandbox: %v", err)
+			mgr = sandbox.NewDisabledManager()
+		}
+	default:
+		mgr = sandbox.NewDisabledManager()
+	}
+	logger.Infof(ctx, "Sandbox configured: mode=%s, timeout=%ds, image=%s", sandboxMode, sandboxTimeout, dockerImage)
+	s.sandboxMgr = mgr
+	return mgr
 }
 
 // NewAgentService creates a new agent service
@@ -342,46 +394,9 @@ func (s *agentService) initializeSkillsManager(
 	config *types.AgentConfig,
 	toolRegistry *tools.ToolRegistry,
 ) (*skills.Manager, error) {
-	// Initialize sandbox manager based on environment variables
-	// WEKNORA_SANDBOX_MODE: "docker", "local", "disabled" (default: "disabled")
-	// WEKNORA_SANDBOX_TIMEOUT: timeout in seconds (default: 60)
-	// WEKNORA_SANDBOX_DOCKER_IMAGE: custom Docker image (default: wechatopenai/weknora-sandbox:latest)
-	var sandboxMgr sandbox.Manager
-	var err error
-
-	sandboxMode := os.Getenv("WEKNORA_SANDBOX_MODE")
-	if sandboxMode == "" {
-		sandboxMode = "disabled"
-	}
-	dockerImage := os.Getenv("WEKNORA_SANDBOX_DOCKER_IMAGE")
-	if dockerImage == "" {
-		dockerImage = sandbox.DefaultDockerImage
-	}
-	sandboxTimeoutStr := os.Getenv("WEKNORA_SANDBOX_TIMEOUT")
-	sandboxTimeout := 60
-	if sandboxTimeoutStr != "" {
-		if v, err := strconv.Atoi(sandboxTimeoutStr); err == nil && v > 0 {
-			sandboxTimeout = v
-		}
-	}
-
-	switch sandboxMode {
-	case "docker":
-		sandboxMgr, err = sandbox.NewManagerFromType("docker", true, dockerImage) // Enable fallback to local
-		if err != nil {
-			logger.Warnf(ctx, "Failed to initialize Docker sandbox, falling back to disabled: %v", err)
-			sandboxMgr = sandbox.NewDisabledManager()
-		}
-	case "local":
-		sandboxMgr, err = sandbox.NewManagerFromType("local", false, "")
-		if err != nil {
-			logger.Warnf(ctx, "Failed to initialize local sandbox: %v", err)
-			sandboxMgr = sandbox.NewDisabledManager()
-		}
-	default:
-		sandboxMgr = sandbox.NewDisabledManager()
-	}
-	logger.Infof(ctx, "Sandbox configured: mode=%s, timeout=%ds, image=%s", sandboxMode, sandboxTimeout, dockerImage)
+	// Use the shared, lazily-initialized sandbox manager (also used by the
+	// write_file / bash shell tools).
+	sandboxMgr := s.getSandboxManager(ctx)
 
 	// Create skills manager
 	skillsConfig := &skills.ManagerConfig{
@@ -402,7 +417,7 @@ func (s *agentService) initializeSkillsManager(
 	toolRegistry.RegisterTool(readSkillTool)
 	logger.Infof(ctx, "Registered read_skill tool")
 
-	if sandboxMode != "disabled" {
+	if sandboxMgr != nil && sandboxMgr.GetType() != sandbox.SandboxTypeDisabled {
 		executeSkillTool := tools.NewExecuteSkillScriptTool(skillsManager)
 		toolRegistry.RegisterTool(executeSkillTool)
 		logger.Infof(ctx, "Registered execute_skill_script tool")
@@ -420,6 +435,11 @@ func (s *agentService) registerTools(
 	chatModel chat.Chat,
 	sessionID string,
 ) error {
+	// Prepare a session-scoped temporary workspace for the shell tools
+	// (write_file / bash). It is isolated per session and never persisted.
+	sandboxMgr := s.getSandboxManager(ctx)
+	shellWorkDir := sessionScratchDir(sessionID)
+
 	// Source of truth policy:
 	//   - `config.AllowedTools` is the explicit, user-editable whitelist —
 	//     populated by the agent-type preset on create and freely editable
@@ -625,6 +645,22 @@ func (s *agentService) registerTools(
 			toolToRegister = tools.NewWebFetchTool(chatModel)
 			logger.Infof(ctx, "Registered web_fetch tool for session: %s", sessionID)
 
+		case tools.ToolBash:
+			if sandboxMgr != nil && sandboxMgr.GetType() != sandbox.SandboxTypeDisabled {
+				toolToRegister = tools.NewBashTool(sandboxMgr, shellWorkDir)
+				logger.Infof(ctx, "Registered bash tool for session: %s (sandbox=%s)", sessionID, sandboxMgr.GetType())
+			} else {
+				logger.Warnf(ctx, "bash tool requested but sandbox is disabled; not registering")
+			}
+
+		case tools.ToolWriteFile:
+			if sandboxMgr != nil && sandboxMgr.GetType() != sandbox.SandboxTypeDisabled {
+				toolToRegister = tools.NewWriteFileTool(sandboxMgr, shellWorkDir)
+				logger.Infof(ctx, "Registered write_file tool for session: %s (sandbox=%s)", sessionID, sandboxMgr.GetType())
+			} else {
+				logger.Warnf(ctx, "write_file tool requested but sandbox is disabled; not registering")
+			}
+
 		case tools.ToolDataAnalysis:
 			toolToRegister = tools.NewDataAnalysisTool(s.knowledgeBaseService, s.knowledgeService, s.tenantService, s.fileService, s.duckdb, sessionID, s.storageResolver)
 			logger.Infof(ctx, "Registered data_analysis tool for session: %s", sessionID)
@@ -669,6 +705,25 @@ func (s *agentService) registerTools(
 
 	logger.Infof(ctx, "Registered %d tools", len(registry.ListTools()))
 	return nil
+}
+
+// sessionScratchDir returns a session-scoped temporary working directory used
+// by the shell tools (write_file / bash). Each session gets an isolated,
+// non-persistent workspace under the OS temp dir.
+func sessionScratchDir(sessionID string) string {
+	base := filepath.Join(os.TempDir(), "weknora_agent_ws")
+	dir := filepath.Join(base, sanitizeSessionID(sessionID))
+	return dir
+}
+
+// sanitizeSessionID makes a session identifier safe for use in a filesystem
+// path.
+func sanitizeSessionID(id string) string {
+	if id == "" {
+		return "default"
+	}
+	re := regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+	return re.ReplaceAllString(id, "_")
 }
 
 // ValidateConfig validates the agent configuration
