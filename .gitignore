@@ -57,3 +57,6 @@ fix-docker.sh
 
 # WeChat Mini Program local/private configuration
 miniprogram/project.private.config.json
+
+# Skill: ai-pm-analyst (本地私有 skill，不纳入版本控制)
+skills/preloaded/ai-pm-analyst/
