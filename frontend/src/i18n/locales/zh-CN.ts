@@ -6026,6 +6026,11 @@ export default {
       dataAnalysisDesc: "理解数据文件并进行数据分析",
       dataSchema: "查看数据元信息",
       dataSchemaDesc: "获取表格文件的元信息",
+      // Shell / 文件操作（沙箱内，高危）
+      bash: "执行命令",
+      bashDesc: "在沙箱中执行 shell 命令（受限命令白名单，无网络，仅限会话临时目录）",
+      writeFile: "写文件",
+      writeFileDesc: "在沙箱的会话临时目录中写入文件（无法访问目录之外）",
       requiresKb: "（需要配置知识库）",
       requiresRagKb: "（需要关联启用向量/关键词索引的知识库）",
       requiresWikiKb: "（需要关联启用 Wiki 能力的知识库）",
@@ -6062,6 +6067,7 @@ export default {
       groupWikiEdit: "Wiki 编辑",
       groupWikiIssue: "Wiki 巡检",
       groupData: "数据分析",
+      groupShell: "Shell / 文件操作",
       writeWarning: "会修改 Wiki 内容",
       dangerTag: "可写",
       // 顶部状态栏

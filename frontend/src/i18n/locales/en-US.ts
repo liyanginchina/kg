@@ -5877,6 +5877,10 @@ export default {
       dataAnalysisDesc: 'Understand data files and perform data analysis',
       dataSchema: 'View Data Schema',
       dataSchemaDesc: 'Get metadata of tabular files',
+      bash: 'Run Command',
+      bashDesc: 'Execute a shell command in the sandbox (deny-list, no network, session temp dir only)',
+      writeFile: 'Write File',
+      writeFileDesc: 'Write a file into the sandbox session temp directory (no access outside it)',
       requiresKb: '(requires knowledge base configuration)',
       requiresRagKb: '(requires a KB with vector/keyword indexing enabled)',
       requiresWikiKb: '(requires a Wiki-enabled knowledge base)',
@@ -5913,6 +5917,7 @@ export default {
       groupWikiEdit: 'Wiki Edit',
       groupWikiIssue: 'Wiki Review',
       groupData: 'Data Analysis',
+      groupShell: 'Shell / File Ops',
       writeWarning: 'Mutates Wiki content',
       dangerTag: 'Write',
       // Status bar

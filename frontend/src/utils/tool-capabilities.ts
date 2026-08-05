@@ -45,6 +45,12 @@ export const TOOL_CAPABILITY_REQUIREMENTS: Record<string, ToolRequirement> = {
   thinking: {},
   todo_write: {},
 
+  // ---- Shell / file-write (sandbox, no KB dependency, high-risk) ----
+  // Explicitly declared as always-available so the UI doesn't gate them on a
+  // knowledge base being in scope. They run inside the sandbox regardless.
+  bash:       {},
+  write_file: {},
+
   // ---- RAG / chunk retrieval (need at least one chunk-indexed KB) ----
   // We use vector|keyword as the canonical "has RAG chunks" signal. FAQ KBs
   // also expose chunks, but the current UX message bucket is "RAG KB"; once

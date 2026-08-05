@@ -5973,6 +5973,10 @@ export default {
       dataAnalysisDesc: '데이터 파일을 이해하고 데이터 분석 수행',
       dataSchema: '데이터 스키마 보기',
       dataSchemaDesc: '테이블 파일의 메타 정보 조회',
+      bash: '명령 실행',
+      bashDesc: '샌드박스에서 셸 명령 실행 (deny-list, 네트워크 차단, 세션 임시 디렉토리만)',
+      writeFile: '파일 쓰기',
+      writeFileDesc: '샌드박스 세션 임시 디렉토리에 파일 쓰기 (외부 접근 불가)',
       requiresKb: '(지식베이스 설정 필요)',
       requiresRagKb: '(벡터/키워드 인덱싱이 활성화된 지식베이스가 필요합니다)',
       requiresWikiKb: '(Wiki 기능이 활성화된 지식베이스가 필요합니다)',
@@ -6009,6 +6013,7 @@ export default {
       groupWikiEdit: 'Wiki 편집',
       groupWikiIssue: 'Wiki 점검',
       groupData: '데이터 분석',
+      groupShell: '셸 / 파일 작업',
       writeWarning: 'Wiki 내용을 변경합니다',
       dangerTag: '쓰기',
       // 상태바
