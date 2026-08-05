@@ -3,6 +3,8 @@ package skills
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/Tencent/WeKnora/internal/sandbox"
@@ -171,8 +173,15 @@ func (m *Manager) ListSkillFiles(ctx context.Context, skillName string) ([]strin
 	return m.loader.ListSkillFiles(skillName)
 }
 
-// ExecuteScript executes a script from a skill in the sandbox
-func (m *Manager) ExecuteScript(ctx context.Context, skillName, scriptPath string, args []string, stdin string) (*sandbox.ExecuteResult, error) {
+// ExecuteScript executes a script from a skill in the sandbox.
+//
+// When inputAsFile is true, the caller-provided stdin (the agent's in-memory
+// data) is materialized into a temporary file inside the skill directory and
+// its (workspace-relative) base name is appended as a positional argument. This
+// lets scripts that expect a FILE argument consume the agent's data without the
+// agent needing the write_file tool. In that mode stdin is cleared to avoid
+// feeding the same data twice.
+func (m *Manager) ExecuteScript(ctx context.Context, skillName, scriptPath string, args []string, stdin string, inputAsFile bool) (*sandbox.ExecuteResult, error) {
 	if !m.enabled {
 		return nil, fmt.Errorf("skills are not enabled")
 	}
@@ -202,16 +211,55 @@ func (m *Manager) ExecuteScript(ctx context.Context, skillName, scriptPath strin
 		return nil, fmt.Errorf("file is not an executable script: %s", scriptPath)
 	}
 
+	// Assemble the final args/stdin.
+	finalArgs := args
+	finalStdin := stdin
+	if inputAsFile && stdin != "" {
+		// Materialize the in-memory data into a temp file so scripts that
+		// expect a file argument can read it. The skill directory is bind
+		// mounted into the sandbox, so the script can open the file by its
+		// base name (the container working dir is /workspace).
+		tmpPath, err := writeTempInputFile(filepath.Dir(file.Path), stdin)
+		if err != nil {
+			return nil, fmt.Errorf("failed to materialize input file: %w", err)
+		}
+		defer os.Remove(tmpPath)
+		finalArgs = append(finalArgs, filepath.Base(tmpPath))
+		finalStdin = "" // avoid double-feeding the same data via stdin
+	}
+
 	// Prepare execution config
 	config := &sandbox.ExecuteConfig{
 		Script:  file.Path,
-		Args:    args,
+		Args:    finalArgs,
 		WorkDir: basePath,
-		Stdin:   stdin,
+		Stdin:   finalStdin,
 	}
 
 	// Execute in sandbox
 	return m.sandboxMgr.Execute(ctx, config)
+}
+
+// writeTempInputFile writes content to a uniquely-named temporary file inside
+// dir and returns its absolute path. Callers are responsible for deleting the
+// file afterwards (e.g. via defer os.Remove). The file is chmod'd to 0644 so it
+// remains readable when the skill directory is bind-mounted read-only into the
+// sandbox container.
+func writeTempInputFile(dir, content string) (string, error) {
+	f, err := os.CreateTemp(dir, ".skill_input_*.txt")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(content); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := os.Chmod(f.Name(), 0644); err != nil {
+		// Non-fatal: the file is still written; only the permission hint fails.
+		return f.Name(), nil
+	}
+	return f.Name(), nil
 }
 
 // GetSkillInfo returns detailed information about a skill

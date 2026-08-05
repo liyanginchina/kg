@@ -255,9 +255,11 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata) string {
 
 	builder.WriteString("#### Tool Reference\n\n")
 	builder.WriteString("- `read_skill(skill_name)`: Load full skill instructions (MUST call before using a skill)\n")
-	builder.WriteString("- `execute_skill_script(skill_name, script_path, args, input)`: Run utility scripts bundled with a skill\n")
-	builder.WriteString("  - `input`: Pass data directly via stdin (use this when you have data in memory, e.g. JSON string)\n")
-	builder.WriteString("  - `args`: Command-line arguments (only use `--file` if you have an actual file path in the skill directory)\n")
+	builder.WriteString("- `execute_skill_script(skill_name, script_path, args, input, input_as_file)`: Run utility scripts bundled with a skill\n")
+	builder.WriteString("  - `input`: Data to feed the script.\n")
+	builder.WriteString("  - `input_as_file` (default false): set `true` when the script expects a **file argument** rather than stdin — e.g. the skill says to write a SQL/data file with `write_file`, but you do NOT have the `write_file` tool. The runtime writes `input` to a temporary file and passes its path as an argument, so you do NOT need `write_file`.\n")
+	builder.WriteString("  - When `input_as_file` is false (default), `input` is delivered to the script via **stdin** (use for scripts that read stdin, e.g. JSON pipelines).\n")
+	builder.WriteString("  - `args`: command-line arguments (only use `--file <path>` if you already have a real file in the skill directory).\n")
 
 	return builder.String()
 }

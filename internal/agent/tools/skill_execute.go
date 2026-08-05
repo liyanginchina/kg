@@ -27,6 +27,7 @@ var executeSkillScriptTool = BaseTool{
 - When a skill's instructions reference a utility script (e.g., "Run scripts/analyze_form.py")
 - When automation or data processing is needed as part of skill workflow
 - For deterministic operations where script execution is more reliable than generating code
+- When the skill says to create a data/SQL file with write_file but you do NOT have the write_file tool: pass the data via the 'input' field and set 'input_as_file: true'. The runtime writes the data to a temporary file and hands the path to the script, so no write_file is needed.
 
 ## Security
 - Scripts run in a sandboxed environment with limited permissions
@@ -44,7 +45,8 @@ type ExecuteSkillScriptInput struct {
 	SkillName  string   `json:"skill_name" jsonschema:"Name of the skill containing the script"`
 	ScriptPath string   `json:"script_path" jsonschema:"Relative path to the script within the skill directory (e.g. scripts/analyze.py)"`
 	Args       []string `json:"args,omitempty" jsonschema:"Optional command-line arguments to pass to the script. Note: if using --file flag, you must provide an actual file path that exists in the skill directory. If you have data in memory (not a file), use the 'input' parameter instead."`
-	Input      string   `json:"input,omitempty" jsonschema:"Optional input data to pass to the script via stdin. Use this when you have data in memory (e.g. JSON string) that the script should process. This is equivalent to piping data: echo 'data' | python script.py"`
+	Input      string   `json:"input,omitempty" jsonschema:"Optional input data for the script. By default it is delivered via stdin (equivalent to: echo 'data' | python script.py). Set input_as_file=true if the script expects a FILE argument instead of stdin."`
+	InputAsFile bool    `json:"input_as_file,omitempty" jsonschema:"Set to true when the target script expects a FILE argument (not stdin) -- e.g. the skill told you to write a SQL/data file with the write_file tool, but you do not have write_file. The runtime writes 'input' to a temporary file and passes its path as a positional argument, so you do NOT need the write_file tool. Leave false (default) for scripts that read stdin."`
 }
 
 // ExecuteSkillScriptTool allows the agent to execute skill scripts in a sandbox
@@ -102,7 +104,7 @@ func (t *ExecuteSkillScriptTool) Execute(ctx context.Context, args json.RawMessa
 	logger.Infof(ctx, "[Tool][ExecuteSkillScript] Executing script: %s/%s with args: %v, input length: %d",
 		input.SkillName, input.ScriptPath, input.Args, len(input.Input))
 
-	result, err := t.skillManager.ExecuteScript(ctx, input.SkillName, input.ScriptPath, input.Args, input.Input)
+	result, err := t.skillManager.ExecuteScript(ctx, input.SkillName, input.ScriptPath, input.Args, input.Input, input.InputAsFile)
 	if err != nil {
 		logger.Errorf(ctx, "[Tool][ExecuteSkillScript] Script execution failed: %v", err)
 		return &types.ToolResult{
