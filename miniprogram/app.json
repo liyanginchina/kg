@@ -5,7 +5,7 @@
     "pages/settings/settings"
   ],
   "window": {
-    "navigationBarTitleText": "WeKnora",
+    "navigationBarTitleText": "KGBuddy",
     "navigationBarBackgroundColor": "#0d3b2a",
     "navigationBarTextStyle": "white",
     "backgroundColor": "#f3f3f3"
