@@ -84,7 +84,7 @@ export default {
     reopen: "사용 가이드",
     steps: {
       welcome: {
-        title: "WeKnora에 오신 것을 환영합니다",
+        title: "KGBuddy에 오신 것을 환영합니다",
         desc: "몇 단계만으로 지식 베이스, 대화, 에이전트의 핵심 사용법을 안내합니다. '다음'을 눌러 시작하세요.",
       },
       knowledge: {
@@ -1639,7 +1639,7 @@ export default {
   },
   initialization: {
     title: "초기화",
-    welcome: "WeKnora에 오신 것을 환영합니다",
+    welcome: "KGBuddy에 오신 것을 환영합니다",
     description: "사용을 시작하려면 먼저 시스템을 구성하세요",
     step1: "1단계: LLM 모델 구성",
     step2: "2단계: 임베딩 모델 구성",

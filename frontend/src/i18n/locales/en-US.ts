@@ -84,7 +84,7 @@ export default {
     reopen: 'Product tour',
     steps: {
       welcome: {
-        title: 'Welcome to WeKnora',
+        title: 'Welcome to KGBuddy',
         desc: 'A few quick steps to get you familiar with knowledge bases, chat and agents. Click "Next" to begin.',
       },
       knowledge: {
@@ -1773,7 +1773,7 @@ export default {
   },
   initialization: {
     title: 'Initialization',
-    welcome: 'Welcome to WeKnora',
+    welcome: 'Welcome to KGBuddy',
     description: 'Please configure the system before starting',
     step1: 'Step 1: Configure LLM Model',
     step2: 'Step 2: Configure Embedding Model',
